@@ -1,0 +1,16 @@
+0 ArrowDown
+1 ArrowLeft
+2 ArrowRight
+3 ArrowUp
+4 ButtonSign
+5 Cross
+6 CuttedCircle
+7 Diamond
+8 Octagon
+9 QRcode
+10 QuarterCircle
+11 RecycleSign
+12 Star
+13 Thumb
+14 Trapezium
+15 WarningSign

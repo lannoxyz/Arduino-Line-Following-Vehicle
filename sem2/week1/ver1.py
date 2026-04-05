@@ -1,0 +1,82 @@
+from gpiozero import Motor, PWMOutputDevice
+from pynput import keyboard
+
+# Pin setup
+in1 = 11
+in2 = 13
+in3 = 29
+in4 = 31
+ena = 32
+enb = 33
+
+leftmotor = Motor(in1, in2)
+rightmotor = Motor(in3, in4)
+leftspeed = PWMOutputDevice(ena)
+rightspeed = PWMOutputDevice(enb)
+
+# Key state dictionary
+keys_pressed = {"w": False, "a": False, "s": False, "d": False}
+
+def update_motors():
+    """Update motor speeds and directions based on pressed keys."""
+    if keys_pressed["w"]:
+        # forward
+        leftmotor.forward()
+        rightmotor.forward()
+        leftspeed.value = 0.6
+        rightspeed.value = 0.6
+        if keys_pressed["a"]:  # curve left
+            leftspeed.value = 0.3
+        if keys_pressed["d"]:  # curve right
+            rightspeed.value = 0.3
+    elif keys_pressed["s"]:
+        # backward
+        leftmotor.backward()
+        rightmotor.backward()
+        leftspeed.value = 0.6
+        rightspeed.value = 0.6
+        if keys_pressed["a"]:  # curve left
+            leftspeed.value = 0.3
+        if keys_pressed["d"]:  # curve right
+            rightspeed.value = 0.3
+    elif keys_pressed["a"]:
+        # pivot left
+        leftmotor.backward()
+        rightmotor.forward()
+        leftspeed.value = 0.5
+        rightspeed.value = 0.5
+    elif keys_pressed["d"]:
+        # pivot right
+        leftmotor.forward()
+        rightmotor.backward()
+        leftspeed.value = 0.5
+        rightspeed.value = 0.5
+    else:
+        # stop
+        leftmotor.stop()
+        rightmotor.stop()
+        leftspeed.value = 0
+        rightspeed.value = 0
+
+# Key press handlers
+def on_press(key):
+    try:
+        k = key.char.lower()
+        if k in keys_pressed:
+            keys_pressed[k] = True
+            update_motors()
+    except AttributeError:
+        pass
+
+def on_release(key):
+    try:
+        k = key.char.lower()
+        if k in keys_pressed:
+            keys_pressed[k] = False
+            update_motors()
+    except AttributeError:
+        pass
+
+# Listener
+with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
+    listener.join()
