@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>UNMC Parking</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="layout">
+
+        <!-- Sidebar -->
+        <aside class="sidebar">
+            <div class="brand">
+                <span class="brand-mark">P</span>
+                <div class="brand-text">
+                    <div class="brand-name">UNMC</div>
+                    <div class="brand-sub">Parking System</div>
+                </div>
+            </div>
+
+            <nav class="nav-status">
+                <div class="nav-label">System Status</div>
+                <div class="status-row">
+                    <span class="status-dot" id="dot-cam"></span>
+                    <span class="status-text">Camera</span>
+                    <span class="status-val" id="val-cam">OFFLINE</span>
+                </div>
+                <div class="status-row">
+                    <span class="status-dot" id="dot-sub"></span>
+                    <span class="status-text">Controller</span>
+                    <span class="status-val" id="val-sub">OFFLINE</span>
+                </div>
+            </nav>
+
+            <div class="sidebar-divider"></div>
+
+            <div class="clock-wrap">
+                <div class="clock-time" id="clock">--:--:--</div>
+                <div class="clock-date" id="date">--- --, ----</div>
+            </div>
+
+            <div class="sidebar-divider"></div>
+
+            <div class="nav-label">Parking Overview</div>
+            <div class="slot-summary" id="slot-summary">
+                <div class="summary-count"><span id="count-vacant">4</span><span class="summary-unit">vacant</span></div>
+                <div class="summary-count occ"><span id="count-occ">0</span><span class="summary-unit">occupied</span></div>
+            </div>
+
+            <div class="sidebar-footer">
+                Last frame<br>
+                <span class="mono" id="last-seen">—</span>
+            </div>
+        </aside>
+
+        <!-- Main content -->
+        <main class="content">
+
+            <!-- Video row -->
+            <section class="section">
+                <div class="section-header">
+                    <span class="section-title">Live Surveillance</span>
+                </div>
+                <div class="video-grid">
+                    <div class="video-card">
+                        <div class="video-label">
+                            <span class="badge-live">● LIVE</span>
+                            Raw Feed
+                        </div>
+                        <div class="video-wrap">
+                            <img src="/video/raw" alt="Raw feed" class="video-img">
+                        </div>
+                    </div>
+                    <div class="video-card">
+                        <div class="video-label">
+                            <span class="badge-ai">◈ AI</span>
+                            Processed
+                        </div>
+                        <div class="video-wrap">
+                            <img src="/video/processed" alt="AI processed" class="video-img">
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Slots + Gate row -->
+            <div class="bottom-row">
+
+                <!-- Parking slots -->
+                <section class="section flex-grow">
+                    <div class="section-header">
+                        <span class="section-title">Parking Slots</span>
+                    </div>
+                    <div class="slot-grid">
+                        <div class="slot-card" id="slot-0" onclick="toggleSlot(0)">
+                            <div class="slot-id">A1</div>
+                            <div class="slot-state" id="slot-state-0">VACANT</div>
+                        </div>
+                        <div class="slot-card" id="slot-1" onclick="toggleSlot(1)">
+                            <div class="slot-id">A2</div>
+                            <div class="slot-state" id="slot-state-1">VACANT</div>
+                        </div>
+                        <div class="slot-card" id="slot-2" onclick="toggleSlot(2)">
+                            <div class="slot-id">A3</div>
+                            <div class="slot-state" id="slot-state-2">VACANT</div>
+                        </div>
+                        <div class="slot-card" id="slot-3" onclick="toggleSlot(3)">
+                            <div class="slot-id">A4</div>
+                            <div class="slot-state" id="slot-state-3">VACANT</div>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Gate control -->
+                <section class="section gate-section">
+                    <div class="section-header">
+                        <span class="section-title">Gate Control</span>
+                    </div>
+                    <div class="gate-card">
+                        <div class="gate-top">
+                            <div class="gate-icon">⬡</div>
+                            <div class="gate-info">
+                                <div class="gate-name">Parking Gate</div>
+                                <div class="gate-state" id="gate-main">CLOSED</div>
+                            </div>
+                        </div>
+                        <button class="gate-btn" onclick="triggerGate('in')">
+                            Open Gate
+                        </button>
+                    </div>
+                </section>
+
+            </div>
+        </main>
+    </div>
+
+    <script src="/static/script.js"></script>
+</body>
+</html>
