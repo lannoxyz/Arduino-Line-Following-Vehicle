@@ -38,7 +38,7 @@ camera_resolution = (640, 480)
 jpeg_quality = 60
 flip_mode = -1
 
-binary_threshold = 100
+binary_threshold = 150
 
 # 误差区间定义 (按照 Lanno 的要求)
 dead_zone_pct = 0.03  # 0-10%: 直行死区

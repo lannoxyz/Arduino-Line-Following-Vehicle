@@ -1,0 +1,8 @@
+0 ArrowLeft
+1 ArrowRight
+2 ArrowUp
+3 ButtonSign
+4 QRcode
+5 RecycleSign
+6 Thumb
+7 WarningSign

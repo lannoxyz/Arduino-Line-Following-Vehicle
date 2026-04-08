@@ -1,0 +1,527 @@
+"""
+robot.py — 巡线 + 符号检测 + 反应系统 (修复版)
+Lanno @ University of Nottingham Malaysia
+Electrical Engineering Project
+
+线程分配 (RPi4 四核):
+  Core 0 — Flask Web 服务
+  Core 1 — 巡线视觉处理 + 电机控制 (processing_loop) -> 增加永久停止拦截
+  Core 2 — 相机采集 (capture_loop)
+  Core 3 — ONNX 推理 + 反应触发 (inference_loop)
+"""
+
+import time, sys, threading, os
+from collections import deque
+from flask import Flask, Response, jsonify
+import cv2, numpy as np
+
+# 基础库检查
+try:
+    from picamera2 import Picamera2
+except ImportError:
+    print("错误: sudo apt install python3-picamera2"); sys.exit(1)
+
+try:
+    import RPi.GPIO as GPIO
+except ImportError:
+    print("错误: sudo apt install python3-rpi.gpio"); sys.exit(1)
+
+try:
+    import onnxruntime as ort
+except ImportError:
+    print("错误: pip install onnxruntime --break-system-packages"); sys.exit(1)
+
+# ═══════════════════════════════════════════════════════════════
+#  配置参数 (Configurations)
+# ═══════════════════════════════════════════════════════════════
+
+CAMERA_RESOLUTION = (640, 480)
+JPEG_QUALITY      = 60
+FLIP_MODE         = -1
+
+# 巡线算法参数 (Line Following)
+BINARY_THRESHOLD      = 140
+DEAD_ZONE_PCT         = 0.03
+SPIN_ZONE_PCT         = 0.20
+
+# 速度配置 (Speed)
+BASE_SPEED            = 20
+MAX_SPEED             = 45
+SPIN_SPEED            = 45
+
+# 丢线恢复 (Recovery)
+RECOVERY_ENABLED      = True
+RECOVERY_SPEED        = 45
+RECOVERY_TIMEOUT      = 2.0
+LINE_LOST_THRESHOLD   = 100
+HISTORY_DURATION      = 1.0
+PIXEL_RATIO_THRESHOLD = 0.5
+
+# GPIO 引脚 (L298N / TB6612)
+PIN_IN1, PIN_IN2 = 27, 17
+PIN_IN3, PIN_IN4 = 6, 5
+PIN_ENA, PIN_ENB = 12, 13
+
+# AI 模型参数
+ONNX_MODEL_PATH    = "model.onnx"
+TFLITE_LABELS_PATH = "labels.txt"
+ONNX_INPUT_SIZE    = 224
+# 每个符号独立置信度阈值 (Per-symbol Confidence Thresholds)
+CONF_THRESHOLDS = {
+    "arrowleft":   60.0,
+    "arrowright":  60.0,
+    "arrowup":     60.0,
+    "warningsign": 60.0,
+    "qrcode":      60.0,
+    "thumb":       60.0,
+    "recyclesign": 40.0,
+    "buttonsign":  30.0,
+}
+CONF_THRESHOLD_DEFAULT = 50.0   # fallback for unlisted labels
+
+ACTION_COOLDOWN_SEC = 7.0
+
+PORT = 5000
+
+# ═══════════════════════════════════════════════════════════════
+#  底层控制 (Low-level Control)
+# ═══════════════════════════════════════════════════════════════
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+for pin in [PIN_IN1, PIN_IN2, PIN_IN3, PIN_IN4, PIN_ENA, PIN_ENB]:
+    GPIO.setup(pin, GPIO.OUT)
+
+pwm_a = GPIO.PWM(PIN_ENA, 500); pwm_a.start(0)
+pwm_b = GPIO.PWM(PIN_ENB, 500); pwm_b.start(0)
+
+def set_motors(left, right):
+    """设置电机转速及方向 (-100 to 100)"""
+    left  = max(-100.0, min(100.0, left))
+    right = max(-100.0, min(100.0, right))
+    GPIO.output(PIN_IN1, GPIO.HIGH if left  > 0 else GPIO.LOW)
+    GPIO.output(PIN_IN2, GPIO.LOW  if left  > 0 else (GPIO.HIGH if left  < 0 else GPIO.LOW))
+    GPIO.output(PIN_IN3, GPIO.HIGH if right > 0 else GPIO.LOW)
+    GPIO.output(PIN_IN4, GPIO.LOW  if right > 0 else (GPIO.HIGH if right < 0 else GPIO.LOW))
+    pwm_a.ChangeDutyCycle(abs(left))
+    pwm_b.ChangeDutyCycle(abs(right))
+
+def stop_motors():
+    set_motors(0, 0)
+
+# ═══════════════════════════════════════════════════════════════
+#  视觉与推理 (Vision & Inference)
+# ═══════════════════════════════════════════════════════════════
+
+print("Initializing Camera...")
+picam2 = Picamera2()
+picam2.configure(picam2.create_video_configuration(
+    main={"size": CAMERA_RESOLUTION, "format": "BGR888"},
+    controls={"FrameDurationLimits": (16666, 16666)}))
+picam2.start(); time.sleep(1)
+
+_session = _input_name = None
+_labels  = []
+
+def _load_onnx():
+    global _session, _labels, _input_name
+    if not os.path.exists(TFLITE_LABELS_PATH): return False
+    with open(TFLITE_LABELS_PATH) as f:
+        _labels = [l.strip().split(None, 1)[-1] for l in f if l.strip()]
+    if not os.path.exists(ONNX_MODEL_PATH): return False
+    try:
+        _session = ort.InferenceSession(ONNX_MODEL_PATH, providers=["CPUExecutionProvider"])
+        _input_name = _session.get_inputs()[0].name
+        return True
+    except Exception as e:
+        print(f"Model Load Failed: {e}"); return False
+
+def _onnx_classify(frame_bgr):
+    resized = cv2.resize(frame_bgr, (ONNX_INPUT_SIZE, ONNX_INPUT_SIZE))
+    gray    = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+    rgb     = cv2.merge([gray, gray, gray])
+    img_f   = (rgb.astype(np.float32) / 255.0 - 0.449) / 0.226
+    blob    = np.transpose(img_f, (2, 0, 1))[np.newaxis, ...]
+    try:
+        scores = _session.run(None, {_input_name: blob})[0][0].astype(np.float32)
+        e_ = np.exp(scores - scores.max())
+        probs = e_ / e_.sum()
+        idx = int(np.argmax(probs))
+        return _labels[idx], float(probs[idx] * 100)
+    except:
+        return "error", 0.0
+
+# ═══════════════════════════════════════════════════════════════
+#  共享状态与同步 (Shared State)
+# ═══════════════════════════════════════════════════════════════
+
+frame_lock = threading.Lock()
+latest_raw_frame = None  # 带叠加显示的帧
+latest_cam_frame = None  # 原始采集帧
+
+state_lock  = threading.Lock()
+robot_state = {
+    "status": "init", "direction": "straight", "error_pct": 0.0,
+    "left_speed": 0.0, "right_speed": 0.0, "fps": 0.0, "black_ratio": 0.0,
+    "line_lost_recovery": "inactive", "recovery_reason": ""
+}
+
+symbol_lock = threading.Lock()
+symbol_state = {"shape": "—", "confidence": 0.0, "action": "none", "flash": False}
+
+action_lock  = threading.Lock()
+action_state = {"running": False, "permanent_stop": False}
+
+_action_cooldown = {}
+frame_history = deque()
+history_lock  = threading.Lock()
+recovery_lock = threading.Lock()
+line_lost_state = {"is_recovering": False, "line_lost_time": None, "recovery_direction": None}
+
+# ═══════════════════════════════════════════════════════════════
+#  丢线恢复逻辑 (Line Recovery)
+# ═══════════════════════════════════════════════════════════════
+
+def add_frame_to_history(binary_image, timestamp):
+    with history_lock:
+        frame_history.append((timestamp, binary_image.copy()))
+        cutoff = timestamp - HISTORY_DURATION
+        while frame_history and frame_history[0][0] < cutoff: frame_history.popleft()
+
+def analyze_pixel_distribution():
+    with history_lock:
+        if not frame_history: return None, 0.0
+        l_px = r_px = 0
+        w = frame_history[0][1].shape[1]
+        for _, b in frame_history:
+            l_px += cv2.countNonZero(b[:, :w//2])
+            r_px += cv2.countNonZero(b[:, w//2:])
+        total = l_px + r_px
+        if total == 0: return None, 0.0
+        r_ratio = r_px / total
+        if r_ratio > PIXEL_RATIO_THRESHOLD: return "right", r_ratio - 0.5
+        if r_ratio < (1.0 - PIXEL_RATIO_THRESHOLD): return "left", 0.5 - r_ratio
+        return None, 0.0
+
+def start_line_recovery():
+    with recovery_lock:
+        if not line_lost_state["is_recovering"]:
+            dir_rec, conf = analyze_pixel_distribution()
+            line_lost_state.update({"is_recovering": True, "line_lost_time": time.time(), "recovery_direction": dir_rec})
+
+def stop_line_recovery():
+    with recovery_lock: line_lost_state["is_recovering"] = False
+
+def get_recovery_state():
+    with recovery_lock:
+        if not line_lost_state["is_recovering"]: return False, None, False
+        elapsed = time.time() - line_lost_state["line_lost_time"]
+        if elapsed > RECOVERY_TIMEOUT:
+            line_lost_state["is_recovering"] = False
+            return False, None, False
+        return True, line_lost_state["recovery_direction"], True
+
+# ═══════════════════════════════════════════════════════════════
+#  反应系统 (Reaction System) - 核心修复点
+# ═══════════════════════════════════════════════════════════════
+
+def _set_action(desc):
+    with symbol_lock: symbol_state["action"] = desc
+
+def _is_in_cooldown(label):
+    return (time.time() - _action_cooldown.get(label.lower(), 0)) < ACTION_COOLDOWN_SEC
+
+def _mark_cooldown(label):
+    _action_cooldown[label.lower()] = time.time()
+
+def execute_action(label):
+    """在独立线程执行反应，确保 permanent_stop 优先被锁定"""
+    key = label.lower()
+
+    # 1. 闪烁类 (Thumb/QR)
+    if key in ("thumb", "qrcode"):
+        _set_action(f"flash_{key}")
+        with symbol_lock: symbol_state["flash"] = True
+        time.sleep(2.5)
+        with symbol_lock: symbol_state["flash"] = False
+        _set_action("none")
+        _mark_cooldown(label)
+        return
+
+    # 2. 永久停止类 (Button/Warning) - 核心修复
+    if key in ("buttonsign", "warningsign"):
+        with action_lock:
+            action_state["permanent_stop"] = True # 先锁定状态位
+            action_state["running"] = False      # 确保不进入 normal action 逻辑
+        _set_action(f"{label} — STOPPED")
+        stop_motors()
+        print(f"[ACTION] Permanent stop triggered by {label}")
+        return # 永久停止不进入 finally 恢复逻辑
+
+    # 3. 动作类 (Arrow/Recycle)
+    # running 已在 inference_loop 的锁内提前置位，此处仅做保险兜底
+    with action_lock:
+        if not action_state["running"]:
+            action_state["running"] = True
+
+    try:
+        stop_motors()          # 确保巡线残留指令先被清除
+        if key == "arrowup":
+            _set_action("ArrowUp — Straight")
+            set_motors(BASE_SPEED, BASE_SPEED); time.sleep(1.2)
+        elif key in ("arrowleft", "arrowright"):
+            direction = "left" if key == "arrowleft" else "right"
+            _set_action(f"Arrow{direction.capitalize()} — Searching line...")
+
+            # 1. 直行一小段，驶过岔路口中心
+            set_motors(BASE_SPEED, BASE_SPEED); time.sleep(0.5)
+
+            # 2. 盲转：甩掉原来的线，不检测
+            spin_l = -SPIN_SPEED if direction == "left" else  SPIN_SPEED
+            spin_r =  SPIN_SPEED if direction == "left" else -SPIN_SPEED
+            set_motors(spin_l, spin_r); time.sleep(0.6)
+
+            # 3. 视觉闭环：转到找到新线为止
+            LINE_CONFIRM_FRAMES = 5   # 连续N帧有线才算找到
+            MAX_SEARCH_TIME     = 3.0 # 超时保护，防止无限转
+            found_count = 0
+            t0 = time.time()
+            while time.time() - t0 < MAX_SEARCH_TIME:
+                set_motors(spin_l, spin_r)
+                time.sleep(0.03)
+                with frame_lock:
+                    f = latest_cam_frame
+                if f is not None:
+                    gray   = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
+                    _, binary = cv2.threshold(gray, BINARY_THRESHOLD, 255, cv2.THRESH_BINARY_INV)
+                    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+                    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+                    moments = cv2.moments(binary)
+                    if moments["m00"] > LINE_LOST_THRESHOLD:
+                        found_count += 1
+                        if found_count >= LINE_CONFIRM_FRAMES:
+                            break   # 连续N帧确认，找到新线
+                    else:
+                        found_count = 0  # 不连续则重置
+            stop_motors()
+            _set_action(f"Arrow{direction.capitalize()} — Done")
+        elif key == "recyclesign":
+            _set_action("Recycle — Spin 360")
+            set_motors(SPIN_SPEED, -SPIN_SPEED); time.sleep(3.0)
+    finally:
+        with action_lock:
+            action_state["running"] = False
+        _set_action("none")
+        _mark_cooldown(label)
+
+# ═══════════════════════════════════════════════════════════════
+#  核心循环 (Thread Loops)
+# ═══════════════════════════════════════════════════════════════
+
+def capture_loop():
+    global latest_cam_frame
+    while True:
+        try:
+            frame = picam2.capture_array()
+            if FLIP_MODE is not None: frame = cv2.flip(frame, FLIP_MODE)
+            with frame_lock: latest_cam_frame = frame
+        except: time.sleep(0.01)
+
+def processing_loop():
+    global latest_raw_frame
+    f_cnt, t_start, cur_fps = 0, time.time(), 0.0
+
+    while True:
+        # 核心修复：严密检查永久停止
+        with action_lock:
+            is_perm = action_state["permanent_stop"]
+            is_run  = action_state["running"]
+
+        with frame_lock: frame = latest_cam_frame
+        if frame is None: time.sleep(0.01); continue
+
+        h, w = frame.shape[:2]
+
+        # 如果永久停止：强制刹车并仅推流
+        if is_perm:
+            stop_motors()
+            with frame_lock: latest_raw_frame = frame.copy()
+            time.sleep(0.1); continue
+
+        # 如果正在执行临时动作：挂起巡线控制，仅推流
+        if is_run:
+            disp = frame.copy()
+            cv2.line(disp, (w//2, 0), (w//2, h-1), (255, 0, 0), 1)
+            with frame_lock: latest_raw_frame = disp
+            time.sleep(0.03); continue
+
+        # --- 正常巡线逻辑 ---
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        _, binary = cv2.threshold(gray, BINARY_THRESHOLD, 255, cv2.THRESH_BINARY_INV)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+
+        moments = cv2.moments(binary)
+        b_ratio = cv2.countNonZero(binary) / (h * w)
+        has_line = moments["m00"] > LINE_LOST_THRESHOLD
+        add_frame_to_history(binary, time.time())
+
+        l_spd = r_spd = 0
+        stat = drct = "no_line"; err = 0.0; rec_s = "inactive"; rec_r = ""
+        cx = cy = -1
+
+        if has_line:
+            stop_line_recovery()
+            cx, cy = int(moments["m10"]/moments["m00"]), int(moments["m01"]/moments["m00"])
+            err = (cx - w/2) / (w/2)
+            abs_err = abs(err)
+
+            if abs_err <= DEAD_ZONE_PCT:
+                stat = drct = "straight"; l_spd = r_spd = BASE_SPEED
+            elif abs_err <= SPIN_ZONE_PCT:
+                k = (abs_err - DEAD_ZONE_PCT) / (SPIN_ZONE_PCT - DEAD_ZONE_PCT)
+                outer = BASE_SPEED + k * (MAX_SPEED - BASE_SPEED)
+                if err > 0: drct="right"; stat="adjust_right"; l_spd=outer; r_spd=BASE_SPEED
+                else: drct="left"; stat="adjust_left"; l_spd=BASE_SPEED; r_spd=outer
+            else:
+                if err > 0: drct=stat="spin_right"; l_spd=SPIN_SPEED; r_spd=-SPIN_SPEED
+                else: drct=stat="spin_left"; l_spd=-SPIN_SPEED; r_spd=SPIN_SPEED
+            set_motors(l_spd, r_spd)
+        else:
+            if RECOVERY_ENABLED:
+                is_r, d, cont = get_recovery_state()
+                if not is_r: start_line_recovery(); is_r, d, cont = get_recovery_state()
+                if cont and d:
+                    rec_s = f"recovery_{d}"; l_spd, r_spd = (RECOVERY_SPEED, -RECOVERY_SPEED) if d=="right" else (-RECOVERY_SPEED, RECOVERY_SPEED)
+                    set_motors(l_spd, r_spd)
+                else: stop_line_recovery(); stop_motors()
+            else: stop_motors()
+
+        # FPS & UI
+        f_cnt += 1
+        if time.time() - t_start >= 1.0:
+            cur_fps = f_cnt / (time.time() - t_start)
+            f_cnt = 0; t_start = time.time()
+
+        with state_lock:
+            robot_state.update({"status":stat, "direction":drct, "error_pct":round(err*100,1), "left_speed":l_spd, "right_speed":r_spd, "fps":round(cur_fps,1), "black_ratio":round(b_ratio*100,1)})
+
+        disp = frame.copy()
+        cv2.line(disp, (w//2, 0), (w//2, h-1), (255, 0, 0), 1)
+        if has_line:
+            cv2.circle(disp, (cx, cy), 10, (0, 0, 255), -1)
+            cv2.line(disp, (w//2, cy), (cx, cy), (0, 255, 0), 2)
+        with frame_lock: latest_raw_frame = disp
+
+def inference_loop():
+    while True:
+        with frame_lock: f = latest_cam_frame
+        if f is None or _session is None: time.sleep(0.05); continue
+
+        label, conf = _onnx_classify(f)
+        with symbol_lock: symbol_state.update({"shape": label, "confidence": conf})
+
+        threshold = CONF_THRESHOLDS.get(label.lower(), CONF_THRESHOLD_DEFAULT)
+        if conf >= threshold:
+            spawned = False
+            with action_lock:
+                busy = action_state["running"] or action_state["permanent_stop"]
+                if not busy and not _is_in_cooldown(label):
+                    # 在锁内直接置位，消除竞态窗口
+                    if label.lower() not in ("thumb", "qrcode", "buttonsign", "warningsign"):
+                        action_state["running"] = True
+                    spawned = True
+            if spawned:
+                threading.Thread(target=execute_action, args=(label,), daemon=True).start()
+        time.sleep(0.1)
+
+# ═══════════════════════════════════════════════════════════════
+#  Flask & Web
+# ═══════════════════════════════════════════════════════════════
+
+app = Flask(__name__)
+
+@app.route('/')
+def index():
+    return """<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Lanno's Robot</title>
+    <style>
+        body { margin:0; background:#000; color:#fff; font-family:monospace; display:flex; flex-direction:column; align-items:center; padding:16px; }
+        img { width:100%; max-width:640px; border-radius:8px; border: 2px solid #333; }
+        #result { margin-top:15px; text-align:center; }
+        #shape { font-size:32px; font-weight:bold; color: #00d2ff; }
+        #action { font-size:18px; color:#ff9f43; margin-top:8px; }
+        #alert_msg { margin-top:10px; font-size:20px; color:#4cd137; opacity:0; transition:0.3s; }
+        .flashing { animation: flash 0.25s 6; }
+        @keyframes flash { 0%,100% {opacity:1;} 50% {opacity:0.2;} }
+    </style></head><body>
+    <img src="/video">
+    <div id="result">
+        <div id="shape">—</div>
+        <div id="conf"></div>
+        <div id="action"></div>
+        <div id="alert_msg">Detected!</div>
+    </div>
+    <script>
+        let prev_flash = false;
+        setInterval(async () => {
+            const res = await fetch('/api/symbol').then(r => r.json());
+            document.getElementById('shape').textContent = res.shape;
+            document.getElementById('conf').textContent = res.confidence + '%';
+            document.getElementById('action').textContent = res.action !== 'none' ? res.action : '';
+            
+            const alert = document.getElementById('alert_msg');
+            if(res.flash && !prev_flash) {
+                alert.textContent = res.shape + " DETECTED!";
+                alert.style.opacity = 1;
+                document.getElementById('shape').classList.add('flashing');
+                setTimeout(() => { 
+                    alert.style.opacity = 0; 
+                    document.getElementById('shape').classList.remove('flashing');
+                }, 3000);
+            }
+            prev_flash = res.flash;
+        }, 300);
+    </script></body></html>"""
+
+@app.route('/video')
+def video():
+    def gen():
+        while True:
+            with frame_lock: f = latest_raw_frame
+            if f is not None:
+                _, buf = cv2.imencode('.jpg', f, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+                yield b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buf.tobytes() + b'\r\n'
+            time.sleep(0.04)
+    return Response(gen(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route('/api/symbol')
+def api_symbol():
+    with symbol_lock: return jsonify(dict(symbol_state))
+
+# ═══════════════════════════════════════════════════════════════
+#  启动入口 (Entry Point)
+# ═══════════════════════════════════════════════════════════════
+
+if __name__ == '__main__':
+    _load_onnx()
+    import ctypes
+    def _set_affinity(mask):
+        try: ctypes.CDLL('libc.so.6').sched_setaffinity(0, ctypes.sizeof(ctypes.c_ulong), ctypes.byref(ctypes.c_ulong(mask)))
+        except: pass
+
+    def _spawn(target, mask, name):
+        def wrap(): _set_affinity(mask); target()
+        threading.Thread(target=wrap, name=name, daemon=True).start()
+
+    _spawn(capture_loop, 0b0100, "cap")     # Core 2
+    _spawn(processing_loop, 0b0010, "line") # Core 1
+    _spawn(inference_loop, 0b1000, "inf")   # Core 3
+    _set_affinity(0b0001)                   # Flask -> Core 0
+
+    try:
+        app.run(host='0.0.0.0', port=PORT, threaded=True, use_reloader=False)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop_motors(); picam2.stop(); GPIO.cleanup()
