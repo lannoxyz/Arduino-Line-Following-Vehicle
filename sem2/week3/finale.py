@@ -1,11 +1,16 @@
 """
-robot.py — 巡线 + 符号检测 + 反应系统 (修复版)
+robot.py — 巡线 + 色块跟随 + 符号检测 + 反应系统
 Lanno @ University of Nottingham Malaysia
 Electrical Engineering Project
 
+巡线优先级:
+  ① 高饱和度色块跟随 (S > 220, area > 100px) — 最高优先级
+  ② 黑线跟随 (标准模式)
+  ③ 丢线恢复 (历史帧方向旋转)
+
 线程分配 (RPi4 四核):
   Core 0 — Flask Web 服务
-  Core 1 — 巡线视觉处理 + 电机控制 (processing_loop) -> 增加永久停止拦截
+  Core 1 — 巡线视觉处理 + 电机控制 (processing_loop)
   Core 2 — 相机采集 (capture_loop)
   Core 3 — ONNX 推理 + 反应触发 (inference_loop)
 """
@@ -40,22 +45,27 @@ JPEG_QUALITY      = 60
 FLIP_MODE         = -1
 
 # 巡线算法参数 (Line Following)
-BINARY_THRESHOLD      = 140
-DEAD_ZONE_PCT         = 0.03
+BINARY_THRESHOLD      = 80
+DEAD_ZONE_PCT         = 0.05
 SPIN_ZONE_PCT         = 0.20
 
 # 速度配置 (Speed)
 BASE_SPEED            = 20
-MAX_SPEED             = 45
-SPIN_SPEED            = 45
+MAX_SPEED             = 42
+SPIN_SPEED            = 42
 
 # 丢线恢复 (Recovery)
 RECOVERY_ENABLED      = True
-RECOVERY_SPEED        = 45
-RECOVERY_TIMEOUT      = 2.0
+RECOVERY_SPEED        = 42
+RECOVERY_TIMEOUT      = 3.0
 LINE_LOST_THRESHOLD   = 100
 HISTORY_DURATION      = 1.0
 PIXEL_RATIO_THRESHOLD = 0.5
+
+# 色块巡线参数 (Color Blob Following)
+COLOR_BLOB_SAT_THRESHOLD = 220   # HSV 饱和度阈值，超过才算色块
+COLOR_BLOB_MIN_AREA      = 100   # 色块最小面积 (px²)，低于此值忽略
+COLOR_BLOB_VAL_MIN       = 30    # HSV 亮度下限，排除极暗噪点
 
 # GPIO 引脚 (L298N / TB6612)
 PIN_IN1, PIN_IN2 = 27, 17
@@ -66,6 +76,7 @@ PIN_ENA, PIN_ENB = 12, 13
 ONNX_MODEL_PATH    = "model.onnx"
 TFLITE_LABELS_PATH = "labels.txt"
 ONNX_INPUT_SIZE    = 224
+
 # 每个符号独立置信度阈值 (Per-symbol Confidence Thresholds)
 CONF_THRESHOLDS = {
     "arrowleft":   60.0,
@@ -163,7 +174,8 @@ state_lock  = threading.Lock()
 robot_state = {
     "status": "init", "direction": "straight", "error_pct": 0.0,
     "left_speed": 0.0, "right_speed": 0.0, "fps": 0.0, "black_ratio": 0.0,
-    "line_lost_recovery": "inactive", "recovery_reason": ""
+    "line_lost_recovery": "inactive", "recovery_reason": "",
+    "blob_mode": False  # 是否处于色块跟随模式
 }
 
 symbol_lock = threading.Lock()
@@ -177,6 +189,46 @@ frame_history = deque()
 history_lock  = threading.Lock()
 recovery_lock = threading.Lock()
 line_lost_state = {"is_recovering": False, "line_lost_time": None, "recovery_direction": None}
+
+# ═══════════════════════════════════════════════════════════════
+#  色块检测 (Color Blob Detection)
+# ═══════════════════════════════════════════════════════════════
+
+def _detect_color_blob(frame_bgr):
+    """
+    检测帧中高饱和度色块，返回质心坐标与掩膜。
+
+    原理：
+      - 转换到 HSV 空间，利用饱和度通道 S 独立于亮度的特性
+      - S > COLOR_BLOB_SAT_THRESHOLD 可靠过滤白/灰/黑等低饱和色
+      - 形态学开运算去除噪点，闭运算填补空洞
+      - 用矩计算色块质心
+
+    返回:
+      (cx, cy, sat_mask) — 找到色块时 cx/cy 为质心坐标
+      (None, None, sat_mask) — 未找到足够大色块
+    """
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+
+    # 提取高饱和度掩膜 (排除极暗区域避免噪点)
+    sat_mask = cv2.inRange(
+        hsv,
+        (0,   COLOR_BLOB_SAT_THRESHOLD, COLOR_BLOB_VAL_MIN),
+        (180, 255,                      255)
+    )
+
+    # 形态学处理：先开运算去噪，再闭运算填补色块内部空洞
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    sat_mask = cv2.morphologyEx(sat_mask, cv2.MORPH_OPEN,  kernel)
+    sat_mask = cv2.morphologyEx(sat_mask, cv2.MORPH_CLOSE, kernel)
+
+    moments = cv2.moments(sat_mask)
+    if moments["m00"] > COLOR_BLOB_MIN_AREA:
+        cx = int(moments["m10"] / moments["m00"])
+        cy = int(moments["m01"] / moments["m00"])
+        return cx, cy, sat_mask
+
+    return None, None, sat_mask
 
 # ═══════════════════════════════════════════════════════════════
 #  丢线恢复逻辑 (Line Recovery)
@@ -207,7 +259,11 @@ def start_line_recovery():
     with recovery_lock:
         if not line_lost_state["is_recovering"]:
             dir_rec, conf = analyze_pixel_distribution()
-            line_lost_state.update({"is_recovering": True, "line_lost_time": time.time(), "recovery_direction": dir_rec})
+            line_lost_state.update({
+                "is_recovering": True,
+                "line_lost_time": time.time(),
+                "recovery_direction": dir_rec
+            })
 
 def stop_line_recovery():
     with recovery_lock: line_lost_state["is_recovering"] = False
@@ -222,7 +278,7 @@ def get_recovery_state():
         return True, line_lost_state["recovery_direction"], True
 
 # ═══════════════════════════════════════════════════════════════
-#  反应系统 (Reaction System) - 核心修复点
+#  反应系统 (Reaction System)
 # ═══════════════════════════════════════════════════════════════
 
 def _set_action(desc):
@@ -248,42 +304,43 @@ def execute_action(label):
         _mark_cooldown(label)
         return
 
-    # 2. 永久停止类 (Button/Warning) - 核心修复
+    # 2. 永久停止类 (Button/Warning)
     if key in ("buttonsign", "warningsign"):
         with action_lock:
-            action_state["permanent_stop"] = True # 先锁定状态位
-            action_state["running"] = False      # 确保不进入 normal action 逻辑
+            action_state["permanent_stop"] = True
+            action_state["running"] = False
         _set_action(f"{label} — STOPPED")
         stop_motors()
         print(f"[ACTION] Permanent stop triggered by {label}")
-        return # 永久停止不进入 finally 恢复逻辑
+        return  # 永久停止不进入 finally 恢复逻辑
 
     # 3. 动作类 (Arrow/Recycle)
-    # running 已在 inference_loop 的锁内提前置位，此处仅做保险兜底
     with action_lock:
         if not action_state["running"]:
             action_state["running"] = True
 
     try:
-        stop_motors()          # 确保巡线残留指令先被清除
+        stop_motors()  # 确保巡线残留指令先被清除
         if key == "arrowup":
             _set_action("ArrowUp — Straight")
             set_motors(BASE_SPEED, BASE_SPEED); time.sleep(1.2)
+
         elif key in ("arrowleft", "arrowright"):
             direction = "left" if key == "arrowleft" else "right"
             _set_action(f"Arrow{direction.capitalize()} — Searching line...")
 
             # 1. 直行一小段，驶过岔路口中心
-            set_motors(BASE_SPEED, BASE_SPEED); time.sleep(0.5)
+            stop_motors()
+            set_motors(BASE_SPEED, BASE_SPEED); time.sleep(0.8)
 
             # 2. 盲转：甩掉原来的线，不检测
             spin_l = -SPIN_SPEED if direction == "left" else  SPIN_SPEED
             spin_r =  SPIN_SPEED if direction == "left" else -SPIN_SPEED
-            set_motors(spin_l, spin_r); time.sleep(0.6)
+            set_motors(spin_l, spin_r); time.sleep(0.5)
 
             # 3. 视觉闭环：转到找到新线为止
-            LINE_CONFIRM_FRAMES = 5   # 连续N帧有线才算找到
-            MAX_SEARCH_TIME     = 3.0 # 超时保护，防止无限转
+            LINE_CONFIRM_FRAMES = 3
+            MAX_SEARCH_TIME     = 3.0
             found_count = 0
             t0 = time.time()
             while time.time() - t0 < MAX_SEARCH_TIME:
@@ -300,14 +357,20 @@ def execute_action(label):
                     if moments["m00"] > LINE_LOST_THRESHOLD:
                         found_count += 1
                         if found_count >= LINE_CONFIRM_FRAMES:
-                            break   # 连续N帧确认，找到新线
+                            break
                     else:
-                        found_count = 0  # 不连续则重置
+                        found_count = 0
             stop_motors()
             _set_action(f"Arrow{direction.capitalize()} — Done")
+
         elif key == "recyclesign":
             _set_action("Recycle — Spin 360")
-            set_motors(SPIN_SPEED, -SPIN_SPEED); time.sleep(3.0)
+            time.sleep(0.1)
+            stop_motors()
+            GROUND_SPIN_SPEED = int(SPIN_SPEED * 1.1)
+            set_motors(GROUND_SPIN_SPEED, -GROUND_SPIN_SPEED)
+            time.sleep(2.8)
+
     finally:
         with action_lock:
             action_state["running"] = False
@@ -327,12 +390,13 @@ def capture_loop():
             with frame_lock: latest_cam_frame = frame
         except: time.sleep(0.01)
 
+
 def processing_loop():
     global latest_raw_frame
     f_cnt, t_start, cur_fps = 0, time.time(), 0.0
 
     while True:
-        # 核心修复：严密检查永久停止
+        # 严密检查永久停止
         with action_lock:
             is_perm = action_state["permanent_stop"]
             is_run  = action_state["running"]
@@ -355,64 +419,158 @@ def processing_loop():
             with frame_lock: latest_raw_frame = disp
             time.sleep(0.03); continue
 
-        # --- 正常巡线逻辑 ---
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        _, binary = cv2.threshold(gray, BINARY_THRESHOLD, 255, cv2.THRESH_BINARY_INV)
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
-        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-
-        moments = cv2.moments(binary)
-        b_ratio = cv2.countNonZero(binary) / (h * w)
-        has_line = moments["m00"] > LINE_LOST_THRESHOLD
-        add_frame_to_history(binary, time.time())
-
-        l_spd = r_spd = 0
-        stat = drct = "no_line"; err = 0.0; rec_s = "inactive"; rec_r = ""
+        # ── 初始化本帧状态变量 ──────────────────────────────────
+        l_spd = r_spd = 0.0
+        stat = drct = "no_line"
+        err = 0.0
+        rec_s = "inactive"; rec_r = ""
         cx = cy = -1
+        b_ratio = 0.0
+        blob_mode = False
 
-        if has_line:
-            stop_line_recovery()
-            cx, cy = int(moments["m10"]/moments["m00"]), int(moments["m01"]/moments["m00"])
-            err = (cx - w/2) / (w/2)
+        # ══════════════════════════════════════════════════════
+        #  优先级 ① — 高饱和度色块跟随
+        # ══════════════════════════════════════════════════════
+        blob_cx, blob_cy, sat_mask = _detect_color_blob(frame)
+
+        if blob_cx is not None:
+            blob_mode = True
+            stop_line_recovery()  # 色块存在时重置丢线恢复计时
+
+            cx, cy = blob_cx, blob_cy
+            err = (cx - w / 2) / (w / 2)
             abs_err = abs(err)
 
             if abs_err <= DEAD_ZONE_PCT:
-                stat = drct = "straight"; l_spd = r_spd = BASE_SPEED
+                stat = "blob_straight"; drct = "straight"
+                l_spd = r_spd = BASE_SPEED
             elif abs_err <= SPIN_ZONE_PCT:
                 k = (abs_err - DEAD_ZONE_PCT) / (SPIN_ZONE_PCT - DEAD_ZONE_PCT)
                 outer = BASE_SPEED + k * (MAX_SPEED - BASE_SPEED)
-                if err > 0: drct="right"; stat="adjust_right"; l_spd=outer; r_spd=BASE_SPEED
-                else: drct="left"; stat="adjust_left"; l_spd=BASE_SPEED; r_spd=outer
+                if err > 0:
+                    drct = "right"; stat = "blob_adjust_right"
+                    l_spd = outer;      r_spd = BASE_SPEED
+                else:
+                    drct = "left";  stat = "blob_adjust_left"
+                    l_spd = BASE_SPEED; r_spd = outer
             else:
-                if err > 0: drct=stat="spin_right"; l_spd=SPIN_SPEED; r_spd=-SPIN_SPEED
-                else: drct=stat="spin_left"; l_spd=-SPIN_SPEED; r_spd=SPIN_SPEED
-            set_motors(l_spd, r_spd)
-        else:
-            if RECOVERY_ENABLED:
-                is_r, d, cont = get_recovery_state()
-                if not is_r: start_line_recovery(); is_r, d, cont = get_recovery_state()
-                if cont and d:
-                    rec_s = f"recovery_{d}"; l_spd, r_spd = (RECOVERY_SPEED, -RECOVERY_SPEED) if d=="right" else (-RECOVERY_SPEED, RECOVERY_SPEED)
-                    set_motors(l_spd, r_spd)
-                else: stop_line_recovery(); stop_motors()
-            else: stop_motors()
+                if err > 0:
+                    drct = stat = "blob_spin_right"
+                    l_spd =  SPIN_SPEED; r_spd = -SPIN_SPEED
+                else:
+                    drct = stat = "blob_spin_left"
+                    l_spd = -SPIN_SPEED; r_spd =  SPIN_SPEED
 
-        # FPS & UI
+            set_motors(l_spd, r_spd)
+
+            # 叠加显示：青色轮廓 + 质心 + 标签
+            disp = frame.copy()
+            contours, _ = cv2.findContours(sat_mask, cv2.RETR_EXTERNAL,
+                                           cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(disp, contours, -1, (0, 255, 255), 2)
+            cv2.circle(disp, (cx, cy), 10, (0, 255, 255), -1)
+            cv2.line(disp, (w // 2, cy), (cx, cy), (0, 200, 200), 2)
+            cv2.line(disp, (w // 2, 0), (w // 2, h - 1), (255, 0, 0), 1)
+            cv2.putText(disp, "BLOB MODE", (8, 24),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+        else:
+            # ══════════════════════════════════════════════════
+            #  优先级 ② — 黑线跟随 (标准巡线)
+            # ══════════════════════════════════════════════════
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            _, binary = cv2.threshold(gray, BINARY_THRESHOLD, 255,
+                                      cv2.THRESH_BINARY_INV)
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+            binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN,  kernel)
+            binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+
+            moments  = cv2.moments(binary)
+            b_ratio  = cv2.countNonZero(binary) / (h * w)
+            has_line = moments["m00"] > LINE_LOST_THRESHOLD
+            add_frame_to_history(binary, time.time())
+
+            if has_line:
+                stop_line_recovery()
+                cx = int(moments["m10"] / moments["m00"])
+                cy = int(moments["m01"] / moments["m00"])
+                err = (cx - w / 2) / (w / 2)
+                abs_err = abs(err)
+
+                if abs_err <= DEAD_ZONE_PCT:
+                    stat = drct = "straight"
+                    l_spd = r_spd = BASE_SPEED
+                elif abs_err <= SPIN_ZONE_PCT:
+                    k = (abs_err - DEAD_ZONE_PCT) / (SPIN_ZONE_PCT - DEAD_ZONE_PCT)
+                    outer = BASE_SPEED + k * (MAX_SPEED - BASE_SPEED)
+                    if err > 0:
+                        drct = "right"; stat = "adjust_right"
+                        l_spd = outer;      r_spd = BASE_SPEED
+                    else:
+                        drct = "left";  stat = "adjust_left"
+                        l_spd = BASE_SPEED; r_spd = outer
+                else:
+                    if err > 0:
+                        drct = stat = "spin_right"
+                        l_spd =  SPIN_SPEED; r_spd = -SPIN_SPEED
+                    else:
+                        drct = stat = "spin_left"
+                        l_spd = -SPIN_SPEED; r_spd =  SPIN_SPEED
+
+                set_motors(l_spd, r_spd)
+
+            else:
+                # ══════════════════════════════════════════════
+                #  优先级 ③ — 丢线恢复 (历史帧方向旋转)
+                # ══════════════════════════════════════════════
+                if RECOVERY_ENABLED:
+                    is_r, d, cont = get_recovery_state()
+                    if not is_r:
+                        start_line_recovery()
+                        is_r, d, cont = get_recovery_state()
+                    if cont and d:
+                        rec_s = f"recovery_{d}"
+                        l_spd, r_spd = (
+                            (RECOVERY_SPEED, -RECOVERY_SPEED) if d == "right"
+                            else (-RECOVERY_SPEED, RECOVERY_SPEED)
+                        )
+                        set_motors(l_spd, r_spd)
+                    else:
+                        stop_line_recovery()
+                        stop_motors()
+                else:
+                    stop_motors()
+
+            # 叠加显示（黑线模式）
+            disp = frame.copy()
+            cv2.line(disp, (w // 2, 0), (w // 2, h - 1), (255, 0, 0), 1)
+            if has_line and cx != -1:
+                cv2.circle(disp, (cx, cy), 10, (0, 0, 255), -1)
+                cv2.line(disp, (w // 2, cy), (cx, cy), (0, 255, 0), 2)
+
+        # ── FPS 计算 ────────────────────────────────────────────
         f_cnt += 1
         if time.time() - t_start >= 1.0:
             cur_fps = f_cnt / (time.time() - t_start)
             f_cnt = 0; t_start = time.time()
 
         with state_lock:
-            robot_state.update({"status":stat, "direction":drct, "error_pct":round(err*100,1), "left_speed":l_spd, "right_speed":r_spd, "fps":round(cur_fps,1), "black_ratio":round(b_ratio*100,1)})
+            robot_state.update({
+                "status":             stat,
+                "direction":          drct,
+                "error_pct":          round(err * 100, 1),
+                "left_speed":         l_spd,
+                "right_speed":        r_spd,
+                "fps":                round(cur_fps, 1),
+                "black_ratio":        round(b_ratio * 100, 1),
+                "line_lost_recovery": rec_s,
+                "recovery_reason":    rec_r,
+                "blob_mode":          blob_mode,
+            })
 
-        disp = frame.copy()
-        cv2.line(disp, (w//2, 0), (w//2, h-1), (255, 0, 0), 1)
-        if has_line:
-            cv2.circle(disp, (cx, cy), 10, (0, 0, 255), -1)
-            cv2.line(disp, (w//2, cy), (cx, cy), (0, 255, 0), 2)
-        with frame_lock: latest_raw_frame = disp
+        with frame_lock:
+            latest_raw_frame = disp
+
 
 def inference_loop():
     while True:
@@ -428,7 +586,6 @@ def inference_loop():
             with action_lock:
                 busy = action_state["running"] or action_state["permanent_stop"]
                 if not busy and not _is_in_cooldown(label):
-                    # 在锁内直接置位，消除竞态窗口
                     if label.lower() not in ("thumb", "qrcode", "buttonsign", "warningsign"):
                         action_state["running"] = True
                     spawned = True
@@ -451,6 +608,7 @@ def index():
         #result { margin-top:15px; text-align:center; }
         #shape { font-size:32px; font-weight:bold; color: #00d2ff; }
         #action { font-size:18px; color:#ff9f43; margin-top:8px; }
+        #blob_badge { margin-top:6px; font-size:14px; color:#00ffcc; opacity:0; transition:0.3s; }
         #alert_msg { margin-top:10px; font-size:20px; color:#4cd137; opacity:0; transition:0.3s; }
         .flashing { animation: flash 0.25s 6; }
         @keyframes flash { 0%,100% {opacity:1;} 50% {opacity:0.2;} }
@@ -460,27 +618,32 @@ def index():
         <div id="shape">—</div>
         <div id="conf"></div>
         <div id="action"></div>
+        <div id="blob_badge">● BLOB MODE</div>
         <div id="alert_msg">Detected!</div>
     </div>
     <script>
         let prev_flash = false;
         setInterval(async () => {
-            const res = await fetch('/api/symbol').then(r => r.json());
-            document.getElementById('shape').textContent = res.shape;
-            document.getElementById('conf').textContent = res.confidence + '%';
-            document.getElementById('action').textContent = res.action !== 'none' ? res.action : '';
-            
+            const sym = await fetch('/api/symbol').then(r => r.json());
+            document.getElementById('shape').textContent = sym.shape;
+            document.getElementById('conf').textContent = sym.confidence.toFixed(1) + '%';
+            document.getElementById('action').textContent = sym.action !== 'none' ? sym.action : '';
+
             const alert = document.getElementById('alert_msg');
-            if(res.flash && !prev_flash) {
-                alert.textContent = res.shape + " DETECTED!";
+            if(sym.flash && !prev_flash) {
+                alert.textContent = sym.shape + " DETECTED!";
                 alert.style.opacity = 1;
                 document.getElementById('shape').classList.add('flashing');
-                setTimeout(() => { 
-                    alert.style.opacity = 0; 
+                setTimeout(() => {
+                    alert.style.opacity = 0;
                     document.getElementById('shape').classList.remove('flashing');
                 }, 3000);
             }
-            prev_flash = res.flash;
+            prev_flash = sym.flash;
+
+            const st = await fetch('/api/state').then(r => r.json());
+            const badge = document.getElementById('blob_badge');
+            badge.style.opacity = st.blob_mode ? 1 : 0;
         }, 300);
     </script></body></html>"""
 
@@ -499,6 +662,10 @@ def video():
 def api_symbol():
     with symbol_lock: return jsonify(dict(symbol_state))
 
+@app.route('/api/state')
+def api_state():
+    with state_lock: return jsonify(dict(robot_state))
+
 # ═══════════════════════════════════════════════════════════════
 #  启动入口 (Entry Point)
 # ═══════════════════════════════════════════════════════════════
@@ -506,18 +673,24 @@ def api_symbol():
 if __name__ == '__main__':
     _load_onnx()
     import ctypes
+
     def _set_affinity(mask):
-        try: ctypes.CDLL('libc.so.6').sched_setaffinity(0, ctypes.sizeof(ctypes.c_ulong), ctypes.byref(ctypes.c_ulong(mask)))
-        except: pass
+        try:
+            ctypes.CDLL('libc.so.6').sched_setaffinity(
+                0, ctypes.sizeof(ctypes.c_ulong),
+                ctypes.byref(ctypes.c_ulong(mask))
+            )
+        except:
+            pass
 
     def _spawn(target, mask, name):
         def wrap(): _set_affinity(mask); target()
         threading.Thread(target=wrap, name=name, daemon=True).start()
 
-    _spawn(capture_loop, 0b0100, "cap")     # Core 2
-    _spawn(processing_loop, 0b0010, "line") # Core 1
-    _spawn(inference_loop, 0b1000, "inf")   # Core 3
-    _set_affinity(0b0001)                   # Flask -> Core 0
+    _spawn(capture_loop,    0b0100, "cap")   # Core 2
+    _spawn(processing_loop, 0b0010, "line")  # Core 1
+    _spawn(inference_loop,  0b1000, "inf")   # Core 3
+    _set_affinity(0b0001)                    # Flask -> Core 0
 
     try:
         app.run(host='0.0.0.0', port=PORT, threaded=True, use_reloader=False)
