@@ -1,6 +1,5 @@
 """
 robot.py — 巡线 + 色块跟随 + 符号检测 + 反应系统
-Lanno @ University of Nottingham Malaysia
 Electrical Engineering Project
 
 巡线优先级:
@@ -601,7 +600,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def index():
-    return """<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Lanno's Robot</title>
+    return """<!DOCTYPE html><html><head><meta charset="UTF-8"><title>67 Car</title>
     <style>
         body { margin:0; background:#000; color:#fff; font-family:monospace; display:flex; flex-direction:column; align-items:center; padding:16px; }
         img { width:100%; max-width:640px; border-radius:8px; border: 2px solid #333; }
