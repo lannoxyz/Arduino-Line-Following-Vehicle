@@ -15,25 +15,25 @@ ENA, ENB = 12, 13   # Speed Control (PWM)
 
 # Initialize Pins
 for p in [IN1, IN2, IN3, IN4, ENA, ENB]:
-    GPIO.setup(p, GPIO.OUT)
+    GPIO.setup(p, GPIO.OUT) #set gpio to be output pins
     GPIO.output(p, 0)
 
 # PWM Initialization
 current_freq = 100
-pwmA = GPIO.PWM(ENA, 1000)
+pwmA = GPIO.PWM(ENA, 1000) #1000Hz pwm frequency
 pwmB = GPIO.PWM(ENB, 1000)
 pwmA.start(0)
 pwmB.start(0)
 
 # Default Start Speed
-current_speed_pwm = 200
+current_speed_pwm = 200 #200/255 pwm
 action_lock = False
 
 # =========================================
 # 2. Motor Logic Functions
 # =========================================
 def set_duty_cycle(val_0_to_255):
-    duty = max(0, min(100, (val_0_to_255 / 255) * 100))
+    duty = max(0, min(100, (val_0_to_255 / 255) * 100)) # convert into duty cycle in %
     pwmA.ChangeDutyCycle(duty)
     pwmB.ChangeDutyCycle(duty)
 
@@ -380,6 +380,7 @@ HTML_TEMPLATE = """
 def index():
     return render_template_string(HTML_TEMPLATE, pwm=current_speed_pwm, freq=current_freq)
 
+# using web interface to control pwm
 @app.route("/set_speed")
 def route_set_speed():
     global current_speed_pwm
@@ -391,7 +392,8 @@ def route_set_speed():
         return "speed_ok"
     except ValueError:
         return "error"
-
+        
+# keyboard access for manual movement
 @app.route("/manual_drive")
 def route_manual():
     global action_lock
