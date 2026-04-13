@@ -1,11 +1,13 @@
 """
-symbol_detector.py — 纯图形检测，无巡线/电机
-用法: python3 symbol_detector.py
+symbol_detector.py
+use: python3 symbol_detector.py
 Dashboard: http://<RPi_IP>:5001
 
-依赖: picamera2, opencv-python, flask, numpy, onnxruntime
-安装: pip install onnxruntime --break-system-packages
+relies on: picamera2, opencv-python, flask, numpy, onnxruntime
+installation: pip install onnxruntime --break-system-packages
 """
+
+# import libraries
 import time, sys, threading, os
 from flask import Flask, Response, jsonify
 import cv2, numpy as np
@@ -13,18 +15,18 @@ import cv2, numpy as np
 try:
     from picamera2 import Picamera2
 except ImportError:
-    print("错误: sudo apt install python3-picamera2"); sys.exit(1)
+    print("error: sudo apt install python3-picamera2"); sys.exit(1)
 
 try:
     import onnxruntime as ort
 except ImportError:
-    print("错误: pip install onnxruntime --break-system-packages"); sys.exit(1)
+    print("error: pip install onnxruntime --break-system-packages"); sys.exit(1)
 
 # ═══════════════════════════════════════════════════════════════
-#  配置
+#  Configuration, parameters
 # ═══════════════════════════════════════════════════════════════
 
-RESOLUTION         = (640, 480)
+RESOLUTION         = (640, 480) # 640 x 480p, highest for 30fps
 JPEG_QUALITY       = 60
 FLIP_MODE          = -1
 
@@ -40,19 +42,19 @@ COOLDOWN_SEC       = 5.0
 PORT               = 5001
 
 # ═══════════════════════════════════════════════════════════════
-#  相机
+#  setup camera
 # ═══════════════════════════════════════════════════════════════
 
-print("初始化相机...")
+print("camera startup...")
 picam2 = Picamera2()
 picam2.configure(picam2.create_video_configuration(
-    main={"size": RESOLUTION, "format": "BGR888"},
+    main={"size": RESOLUTION, "format": "BGR888"}, # capture frame in bgr format
     controls={"FrameDurationLimits": (16666, 16666)}))
 picam2.start(); time.sleep(1)
-print(f"相机就绪  {RESOLUTION}")
+print(f"camera ready  {RESOLUTION}")
 
 # ═══════════════════════════════════════════════════════════════
-#  ONNX Runtime 推理
+#  ONNX Runtime 
 # ═══════════════════════════════════════════════════════════════
 
 _session    = None
@@ -60,43 +62,45 @@ _labels     = []
 _input_name = None
 
 def _load_onnx():
-    """加载 ONNX 模型和标签文件。"""
+    """load onnx model resource file"""
     global _session, _labels, _input_name
 
-    # 加载标签
+    # load labels file
     if not os.path.exists(TFLITE_LABELS_PATH):
-        print(f"[ONNX] 找不到标签文件: {TFLITE_LABELS_PATH}"); return False
+        print(f"[ONNX] unable to load labels file: {TFLITE_LABELS_PATH}"); return False
     with open(TFLITE_LABELS_PATH) as f:
         _labels = [l.strip().split(None, 1)[-1] for l in f if l.strip()]
     print(f"[ONNX] 标签: {_labels}")
 
-    # 加载模型
+    # load ONNX model
     if not os.path.exists(ONNX_MODEL_PATH):
-        print(f"[ONNX] 找不到模型文件: {ONNX_MODEL_PATH}"); return False
+        print(f"[ONNX] unable to locate model file: {ONNX_MODEL_PATH}"); return False
     try:
-        # 优先使用 CPU provider（RPi 上通常只有 CPU）
+        # only CPU on raspberry pi, load CPUProvider
         providers = ["CPUExecutionProvider"]
         _session = ort.InferenceSession(ONNX_MODEL_PATH, providers=providers)
         _input_name = _session.get_inputs()[0].name
         input_shape = _session.get_inputs()[0].shape
-        print(f"[ONNX] 模型加载成功  input={_input_name}  shape={input_shape}")
+        print(f"[ONNX] model import success  input={_input_name}  shape={input_shape}")
         print(f"[ONNX] onnxruntime {ort.__version__}")
         return True
     except Exception as e:
-        print(f"[ONNX] 模型加载失败: {e}")
+        print(f"[ONNX] failed to load model: {e}")
         _session = None
         return False
 
 def _onnx_classify(frame_bgr):
-    """用 ONNX Runtime 推理，返回 (label, confidence)。"""
+    """use ONNX Runtime to identify symbol/shape，return (label, confidence)。"""
     if _session is None:
         return "unknown", 0.0
 
-    # 预处理：resize → RGB → float32 → [0,1] → NCHW
+    # resize → RGB → float32 → [0,1] → NCHW
+    # float 32 conversion is nesessary since calculation will involve decimal
+    # framework expects NCHW, number of image, channels, height, width
     resized = cv2.resize(frame_bgr, (ONNX_INPUT_SIZE, ONNX_INPUT_SIZE))
     rgb     = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
     img_f   = rgb.astype(np.float32) / 255.0          # [0, 1]
-    # NCHW: (1, 3, H, W)
+    # NCHW: (1, 3, H, W), 1 image at a time, 3 channels R G B
     blob    = np.transpose(img_f, (2, 0, 1))[np.newaxis, ...]
 
     try:
@@ -106,7 +110,7 @@ def _onnx_classify(frame_bgr):
         print(f"[ONNX] 推理失败: {e}")
         return "unknown", 0.0
 
-    # Softmax（若模型已内置则结果一致，手动做也无害）
+    # Softmax
     e     = np.exp(scores - scores.max())
     probs = e / e.sum()
 
@@ -116,14 +120,16 @@ def _onnx_classify(frame_bgr):
     return label, conf
 
 # ═══════════════════════════════════════════════════════════════
-#  轮廓检测
+#  Contour detection
 # ═══════════════════════════════════════════════════════════════
 
+# capture frame in bgr, convert into grayscale and into binary
 def _get_contour(frame_bgr):
     gray  = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     adapt = cv2.adaptiveThreshold(gray, 255,
                                    cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                    cv2.THRESH_BINARY_INV, 31, 8)
+    # filtering, canny edge detection, morphological cleaning, find contours
     blur  = cv2.GaussianBlur(gray, (5, 5), 0)
     edges = cv2.Canny(blur, 30, 90)
     edges = cv2.dilate(edges,
@@ -131,24 +137,43 @@ def _get_contour(frame_bgr):
                        iterations=2)
     cnts_e, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     filled = np.zeros_like(edges)
-    for c in cnts_e:
-        if cv2.contourArea(c) > 200:
-            cv2.drawContours(filled, [c], -1, 255, -1)
+    # fill contours larger than 200px
+    if cv2.contourArea(c) > 200:
+        # Draw contour filled solid white
+        cv2.drawContours(filled, [c], -1, 255, -1)
+
+    # Merge adaptive threshold, filled contours to get the best of both
     fg = cv2.bitwise_or(adapt, filled)
-    fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN,
-                          cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
-    fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE,
-                          cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13)))
+
+    # Remove small noise
+    fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13)))
+
+    # Find only outermost contours in the cleaned binary image
     cnts, _ = cv2.findContours(fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    valid   = [c for c in cnts if cv2.contourArea(c) >= SHAPE_MIN_AREA]
+
+    # Filter out contours too small to be a valid shape
+    valid = [c for c in cnts if cv2.contourArea(c) >= SHAPE_MIN_AREA]
+
+    # No valid shape found — return empty result
     if not valid:
         return None, None, 0.0, 0.0
+
+    # Pick the largest contour as the primary shape candidate
     best  = max(valid, key=cv2.contourArea)
     area  = cv2.contourArea(best)
     perim = cv2.arcLength(best, True)
-    circ  = min(1.0, (4 * np.pi * area) / (perim ** 2)) if perim > 0 else 0.0
+
+    # Circularity score: perfect circle = 1.0, square ≈ 0.785, irregular < 0.5
+    circ = min(1.0, (4 * np.pi * area) / (perim ** 2)) if perim > 0 else 0.0
+
+    # Simplify contour into polygon — len(approx) gives corner count
     approx = cv2.approxPolyDP(best, 0.02 * perim, True)
-    ratio  = area / (frame_bgr.shape[0] * frame_bgr.shape[1])
+
+    # Fraction of total frame the shape occupies (0.0 - 1.0)
+    # Small ratio = shape is far, large ratio = shape is close
+    ratio = area / (frame_bgr.shape[0] * frame_bgr.shape[1])
+
     return best, approx, circ, ratio
 
 def _contour_classify(best_c, approx, circ):
@@ -165,7 +190,7 @@ def _contour_classify(best_c, approx, circ):
         return "star" if cv2.contourArea(best_c) / (ha + 1e-5) < 0.75 else "polygon"
 
 # ═══════════════════════════════════════════════════════════════
-#  共享状态
+# thread lock to handle shared camera access for ONNX and contour detection
 # ═══════════════════════════════════════════════════════════════
 
 state_lock = threading.Lock()
@@ -191,7 +216,7 @@ _live = {
 }
 
 # ═══════════════════════════════════════════════════════════════
-#  识别后台线程
+#  identify shapes and symbol
 # ═══════════════════════════════════════════════════════════════
 
 def _identify_bg(frame_bgr, contour, approx, circ):
@@ -221,7 +246,7 @@ def _identify_bg(frame_bgr, contour, approx, circ):
     _live["identifying"] = False
 
 # ═══════════════════════════════════════════════════════════════
-#  处理线程
+#  processing loop
 # ═══════════════════════════════════════════════════════════════
 
 def _put_text(img, text, pos, scale=0.46, color=(0, 255, 0)):
@@ -234,12 +259,14 @@ def processing_loop():
 
     while True:
         try:
+            # capture frame
             now   = time.time()
             frame = picam2.capture_array()
             if FLIP_MODE is not None:
-                frame = cv2.flip(frame, FLIP_MODE)
+                frame = cv2.flip(frame, FLIP_MODE) # flip frame if upside down
             h, w = frame.shape[:2]
 
+            # call function contour detection, and return variables
             best, approx, circ, ratio = _get_contour(frame)
             _live["contour"]    = best
             _live["approx"]     = approx
@@ -249,12 +276,14 @@ def processing_loop():
             in_cooldown = (now - _live["last_trigger"]) < COOLDOWN_SEC
             triggered   = (best is not None) and (ratio >= SHAPE_AREA_RATIO)
 
+            # print current status for debugging
             if triggered and not in_cooldown and not _live["identifying"]:
                 _live["last_trigger"] = now
                 _live["identifying"]  = True
                 with state_lock:
                     det_state["status"]     = "identifying"
                     det_state["shape_name"] = "..."
+
                 threading.Thread(
                     target=_identify_bg,
                     args=(frame.copy(), best, approx, circ),
@@ -266,7 +295,7 @@ def processing_loop():
             with state_lock:
                 det_state["fps"] = round(fps, 1)
 
-            # ── overlay ─────────────────────────────────────
+            # overlay, display footage and drawed contours for debugging, all for flask server
             disp = frame.copy()
 
             if best is not None:
@@ -339,7 +368,6 @@ def processing_loop():
                     _put_text(disp, txt, (8, y_cur), sc, col)
                 y_cur += 17
 
-            # ── 调试帧 ───────────────────────────────────────
             gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             blur  = cv2.GaussianBlur(gray, (5, 5), 0)
             edges = cv2.Canny(blur, 30, 90)
@@ -356,7 +384,7 @@ def processing_loop():
             print(f"[Loop] {e}"); time.sleep(0.05)
 
 # ═══════════════════════════════════════════════════════════════
-#  Flask
+#  Flask server and web interface setup
 # ═══════════════════════════════════════════════════════════════
 
 app = Flask(__name__)
@@ -477,18 +505,18 @@ def api_state():
         return jsonify(dict(det_state))
 
 # ═══════════════════════════════════════════════════════════════
-#  启动
+#  Activation
 # ═══════════════════════════════════════════════════════════════
 
 if __name__ == '__main__':
     _load_onnx()
     threading.Thread(target=processing_loop, daemon=True).start()
-    print("处理线程已启动")
+    print("symbol detection activate")
     try:
         print(f"Dashboard: http://0.0.0.0:{PORT}")
         app.run(host='0.0.0.0', port=PORT, threaded=True, use_reloader=False)
     except KeyboardInterrupt:
-        print("\n关闭中...")
+        print("\nshutting down...")
     finally:
         picam2.stop()
-        print("已安全关闭。")
+        print("shut down successful.")
