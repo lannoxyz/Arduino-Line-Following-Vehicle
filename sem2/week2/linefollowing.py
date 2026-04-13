@@ -1,14 +1,10 @@
 """
-line_follower.py — 纯巡线，无图形检测 (三段式线性控制 + 智能丢线恢复)
-用法: python3 line_follower.py
+line_follower.py
+use: python3 line_follower.py
 Dashboard: http://<RPi_IP>:5000
-
-改进功能: 智能丢线恢复机制 (基于像素分布)
-- 缓存最近1秒内的帧数据
-- 丢线时分析左右两侧黑色像素分布
-- 判断黑线更可能在哪一边，朝该方向旋转修正
 """
 
+# import libraries
 import time
 import sys
 import threading
@@ -17,64 +13,62 @@ from flask import Flask, Response, jsonify
 import cv2
 import numpy as np
 
+# setup picamera
 try:
     from picamera2 import Picamera2
 except ImportError:
-    print("错误: sudo apt install python3-picamera2")
+    print("error: sudo apt install python3-picamera2")
     sys.exit(1)
 
 try:
     import RPi.GPIO as GPIO
 except ImportError:
-    print("错误: sudo apt install python3-rpi.gpio")
+    print("error: sudo apt install python3-rpi.gpio")
     sys.exit(1)
 
 
-# ═══════════════════════════════════════════════════════════════
-# 核心配置参数
-# ═══════════════════════════════════════════════════════════════
-
+# parameters, threshold values declaration
 camera_resolution = (640, 480)
 jpeg_quality = 60
 flip_mode = -1
 
 binary_threshold = 150
 
-# 误差区间定义 (按照 Lanno 的要求)
-dead_zone_pct = 0.03  # 0-10%: 直行死区
-spin_zone_pct = 0.18  # 40%以上: 原地旋转极限区
+# size of zones for line following
+dead_zone_pct = 0.03  # within 3% of error, travel straight
+spin_zone_pct = 0.18  # 82%
 
-# 电机GPIO针脚配置
+# define gpio pins
 pin_in1, pin_in2 = 27, 17
 pin_in3, pin_in4 = 6, 5
 pin_ena, pin_enb = 12, 13
 
-# 速度参数
-base_speed = 40   # 基础直行速度
-max_speed = 60   # 单边轮最大加速上限
-spin_speed = 45   # 原地旋转时的速度
+# speed parameters
+base_speed = 40   # base speed at dead zone
+max_speed = 60   # max speed on one side motor between spin zone and dead zone
+spin_speed = 45   # speed at spin zone, motor in opposite rotation
 
-# 丢线恢复参数 (改进版本 - 基于像素分布)
-line_lost_recovery_enabled = True     # 启用丢线恢复机制
-line_lost_recovery_speed = 45         # 丢线恢复时的旋转速度
-line_lost_recovery_timeout = 2.0      # 恢复尝试的最大时间（秒）
-line_lost_check_threshold = 100       # 丢线判定阈值（黑色像素数）
-recovery_history_duration = 1.0       # 缓存历史帧的时间长度（秒）
-pixel_ratio_threshold = 0.5          # 判断左右倾向的阈值 (0.5=平均, <0.5=更多在左, >0.5=更多在右)
+# parameters when line is lost
+line_lost_recovery_enabled = True     
+line_lost_recovery_speed = 45         # rotating speed to search for line
+line_lost_recovery_timeout = 2.0      # time given to search for line
+line_lost_check_threshold = 100       # line lost when number of black pixel < 100
+recovery_history_duration = 1.0       # duration of "memory" for line recovery
+pixel_ratio_threshold = 0.5           # more black pixels on the left if <0.5, right if > 0.5
 
 
 # ═══════════════════════════════════════════════════════════════
-# GPIO & 电机控制模块
+# GPIO & setup
 # ═══════════════════════════════════════════════════════════════
 
 GPIO.setmode(GPIO.BCM)
 GPIO.setwarnings(False)
 
 for pin in [pin_in1, pin_in2, pin_in3, pin_in4, pin_ena, pin_enb]:
-    GPIO.setup(pin, GPIO.OUT)
+    GPIO.setup(pin, GPIO.OUT) # set gpio output pins
 
 # 设置 PWM 频率为 500Hz
-pwm_a = GPIO.PWM(pin_ena, 500)
+pwm_a = GPIO.PWM(pin_ena, 500) # 500Hz pwm frequency for smoothest performance
 pwm_b = GPIO.PWM(pin_enb, 500)
 
 pwm_a.start(0)
@@ -83,7 +77,7 @@ pwm_b.start(0)
 
 def set_motors(left_power, right_power):
     """
-    设置左右电机速度，范围 -100 到 100
+  setup motor speed in terms of % duty cycle
     """
     left_power = max(-100.0, min(100.0, left_power))
     
@@ -99,15 +93,14 @@ def set_motors(left_power, right_power):
 
 
 def stop_motors():
-    """安全停止所有电机"""
-    set_motors(0, 0)
+    set_motors(0, 0) # function to shut down motors
 
 
 # ═══════════════════════════════════════════════════════════════
-# 相机初始化
+# picam configuration
 # ═══════════════════════════════════════════════════════════════
 
-print("初始化相机...")
+print("camera configuration...")
 
 picam2 = Picamera2()
 picam2.configure(
@@ -119,15 +112,17 @@ picam2.configure(
 picam2.start()
 time.sleep(1)
 
-print("相机就绪")
+print("camera is ready")
 
 
 # ═══════════════════════════════════════════════════════════════
-# 状态机与全局变量
+# state of vehicle, ensure only one thread runs and lock the rest
+# threading.Lock() to lock selected thread
 # ═══════════════════════════════════════════════════════════════
 
 state_lock = threading.Lock()
 
+# state of vehicle
 robot_state = {
     "status": "init",
     "direction": "straight",
@@ -142,35 +137,38 @@ robot_state = {
 }
 
 frame_lock = threading.Lock()
-latest_raw_frame = None
-latest_binary_frame = None
+latest_raw_frame = None # to hold the latest frame captured
+latest_binary_frame = None # to hold to latest frame converted to binary
 
-# 丢线恢复机制的全局变量 (改进版本 - 基于像素分布)
+# line recovery state, search for line
 recovery_lock = threading.Lock()
 
-# 历史帧缓存 - 存储最近 N 秒的二值化帧和时间戳
+# deque to store all binary frames captured in the latest second
 history_lock = threading.Lock()
-frame_history = deque()  # 存储 (timestamp, binary_image) 元组
+frame_history = deque()  
 
+# state of line recovery
 line_lost_state = {
-    "is_recovering": False,        # 是否正在恢复
-    "line_lost_time": None,        # 丢线开始时间
-    "recovery_direction": None,    # 恢复方向: "left", "right", 或 None
+    "is_recovering": False,       
+    "line_lost_time": None,       
+    "recovery_direction": None,   
 }
 
 
 # ═══════════════════════════════════════════════════════════════
-# 智能像素分布分析函数 (改进版本核心)
+# pixel analysation when line is lost, guess on where line should be
+# binary image is flipped so the black line represented in white pixels
+# count number of white pixels in each left and right side and make comparison
 # ═══════════════════════════════════════════════════════════════
 
 def add_frame_to_history(binary_image, timestamp):
     """
-    将二值化帧添加到历史缓存
+    store binary images as timestamp
     """
     with history_lock:
         frame_history.append((timestamp, binary_image.copy()))
         
-        # 清理超过指定时间的历史帧
+        # cleaning of all images that has been stored for > 1s
         cutoff_time = timestamp - recovery_history_duration
         while frame_history and frame_history[0][0] < cutoff_time:
             frame_history.popleft()
@@ -178,10 +176,8 @@ def add_frame_to_history(binary_image, timestamp):
 
 def analyze_pixel_distribution():
     """
-    分析历史帧中的像素分布，判断黑线更可能在左还是右
-    返回: (direction, confidence)
-    direction: "left", "right", 或 None
-    confidence: 0.0-1.0 之间的置信度
+    analyse pixels in binary image
+    make an educated guess, whether or not line should be on the left or right
     """
     with history_lock:
         if not frame_history:
@@ -195,34 +191,35 @@ def analyze_pixel_distribution():
         for timestamp, binary_image in frame_history:
             if height is None:
                 height, width = binary_image.shape[:2]
+
             
-            # 左半边
+        # count number of white pixels
+            # left side of frame
             left_half = binary_image[:, :width//2]
             left_pixels += cv2.countNonZero(left_half)
             
-            # 右半边
+            # right side of frame
             right_half = binary_image[:, width//2:]
             right_pixels += cv2.countNonZero(right_half)
-        
-        # 计算比例
-        total_pixels = left_pixels + right_pixels
+    
+        total_pixels = left_pixels + right_pixels # total number of white pixels in frame
         
         if total_pixels == 0:
             return None, 0.0
         
-        right_ratio = right_pixels / total_pixels  # 右侧像素比例
+        right_ratio = right_pixels / total_pixels  # ratio of white pixels in right side
         
-        # 判断方向和置信度
+        # decide direction of rotation to recover line
         if right_ratio > pixel_ratio_threshold:
-            # 右侧黑线更多
+            # rotate right if more pixels on right side
             direction = "right"
             confidence = right_ratio - 0.5  # 越接近 1.0，置信度越高
         elif right_ratio < (1.0 - pixel_ratio_threshold):
-            # 左侧黑线更多
+            # rotate left otherwise
             direction = "left"
-            confidence = (0.5 - right_ratio)  # 越接近 0.0，置信度越高
+            confidence = (0.5 - right_ratio)  # confidence higher as value approaches 0
         else:
-            # 左右均衡，不确定
+            # balanced ratio on left and right side
             direction = None
             confidence = 0.0
         
@@ -231,18 +228,18 @@ def analyze_pixel_distribution():
 
 def start_line_recovery():
     """
-    启动丢线恢复机制
-    分析历史帧，判断应该朝哪个方向旋转
+    begin line recovery, trigger pixel analysis, start timer
     """
     with recovery_lock:
         if not line_lost_state["is_recovering"]:
-            # 分析像素分布
+
             direction, confidence = analyze_pixel_distribution()
             
             line_lost_state["is_recovering"] = True
             line_lost_state["line_lost_time"] = time.time()
             line_lost_state["recovery_direction"] = direction
-            
+
+            # printing of infomation for debugging
             if direction:
                 print(f"[恢复] 丢线，检测到黑线更可能在 {direction}，置信度: {confidence:.2%}")
             else:
@@ -251,7 +248,7 @@ def start_line_recovery():
 
 def stop_line_recovery():
     """
-    停止丢线恢复机制
+    stop line recovery when line is found, resume line following
     """
     with recovery_lock:
         line_lost_state["is_recovering"] = False
@@ -261,8 +258,9 @@ def stop_line_recovery():
 
 def get_recovery_state():
     """
-    获取当前恢复状态
-    返回: (is_recovering, direction, should_continue)
+    state of recovery
+    is line lost? 
+    is the car still search for line?
     """
     with recovery_lock:
         if not line_lost_state["is_recovering"]:
@@ -271,7 +269,7 @@ def get_recovery_state():
         elapsed = time.time() - line_lost_state["line_lost_time"]
         direction = line_lost_state["recovery_direction"]
         
-        # 超时检查
+        # timeout of 2s
         if elapsed > line_lost_recovery_timeout:
             line_lost_state["is_recovering"] = False
             return False, None, False
@@ -281,27 +279,26 @@ def get_recovery_state():
 
 def perform_recovery_rotation(direction):
     """
-    执行恢复旋转
+    rotate motors to move vehicle in decided direction
     """
     if direction == "right":
-        # 黑线在右边，向右转
         left_speed = line_lost_recovery_speed
         right_speed = -line_lost_recovery_speed
+        
     elif direction == "left":
-        # 黑线在左边，向左转
+        
         left_speed = -line_lost_recovery_speed
         right_speed = line_lost_recovery_speed
+        
     else:
-        # 不确定方向，停止
+        
         left_speed = 0
         right_speed = 0
     
     return left_speed, right_speed
 
 
-# ═══════════════════════════════════════════════════════════════
-# 核心视觉处理与控制线程
-# ═══════════════════════════════════════════════════════════════
+# perform line following in loop
 
 def processing_loop():
     global latest_raw_frame, latest_binary_frame
@@ -311,7 +308,7 @@ def processing_loop():
     current_fps = 0.0
 
     while True:
-        # 抓取图像
+        # capture frame from picam
         frame = picam2.capture_array()
 
         if flip_mode is not None:
@@ -319,30 +316,30 @@ def processing_loop():
 
         height, width = frame.shape[:2]
 
-        # 灰度化与二值化
+       # converting capture frame
+        # bgr to grayscale and to binary
         gray_image = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         _, binary_image = cv2.threshold(
             gray_image,
             binary_threshold,
             255,
-            cv2.THRESH_BINARY_INV
+            cv2.THRESH_BINARY_INV # invert binary image to use moments() and calculate mass center
         )
 
-        # 形态学操作去噪
+        # cleaning and filter, remove small white/black holes due to lighting etc
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
         binary_image = cv2.morphologyEx(binary_image, cv2.MORPH_OPEN, kernel)
         binary_image = cv2.morphologyEx(binary_image, cv2.MORPH_CLOSE, kernel)
 
-        # 计算当前时间戳和图像矩
+        # tracking of current frame and status
         current_time = time.time()
         moments = cv2.moments(binary_image)
-        black_ratio = cv2.countNonZero(binary_image) / (height * width)
+        black_ratio = cv2.countNonZero(binary_image) / (height * width) # named black for minimal confusion, function counts number of white pixels
         has_line = moments["m00"] > line_lost_check_threshold
 
-        # 添加当前帧到历史缓存
         add_frame_to_history(binary_image, current_time)
 
-        # 初始化速度与状态变量
+        # setup default speed and status on startup
         left_speed = 0
         right_speed = 0
         status_text = "no_line"
@@ -352,80 +349,79 @@ def processing_loop():
         recovery_reason = ""
 
         if has_line:
-            # 线已找到，停止恢复
+            # line has been found, stop line recovery
             stop_line_recovery()
             
-            # 计算质心
+            # calculate center of mass of white pixels in inverted binery image
             center_x = int(moments["m10"] / moments["m00"])
             center_y = int(moments["m01"] / moments["m00"])
+            # m00 = total white pixels
+            # m10 = sum of pixel values in the x axis
+            # m01 = sum of pixel values in the y axis
 
-            # 归一化误差范围: -1.0 到 1.0
+            # error: how far off is the line from the center? varies from -1.0-1.0
             error_val = (center_x - width / 2) / (width / 2)
             abs_error = abs(error_val)
 
             # ---------------------------------------------------
-            # 核心逻辑：三段式控制
+            # line following logic in 3 zones
             # ---------------------------------------------------
             
-            # 1. 0% ~ 10%：死区直行
+            # 0% ~ 3% of error：dead zone, proceed forward
             if abs_error <= dead_zone_pct:
                 status_text = "straight"
                 direction_text = "straight"
                 left_speed = base_speed
                 right_speed = base_speed
 
-            # 2. 10% ~ 40%：单边线性加速
+            # 3% ~ 40% of error：increased speed on one side of motor, the other motor speed remain constant
             elif abs_error <= spin_zone_pct:
-                # 计算比例系数 (0.0 -> 1.0)
+                  # linear increase from base speed-max speed depending on how far off is error
                 k_ratio = (abs_error - dead_zone_pct) / (spin_zone_pct - dead_zone_pct)
-                
-                # 外侧轮线性加速，内侧轮保持基础速度
                 outer_speed = base_speed + k_ratio * (max_speed - base_speed)
                 inner_speed = base_speed
 
                 if error_val < 0:
-                    # 偏右，需向右转
+                    # slight off towards right, increase speed on left motor
                     direction_text = "right"
                     status_text = "adjust_right"
                     left_speed = outer_speed
                     right_speed = inner_speed
                 else:
-                    # 偏左，需向左转
+                    # slight off towards left, increase speed on right motor
                     direction_text = "left"
                     status_text = "adjust_left"
                     left_speed = inner_speed
                     right_speed = outer_speed
 
-            # 3. 40% ~ 100%：极限区原地旋转
+            # 3. 40% ~ 100%：spin zone, clockwise/anti clockwise rotation 
             else:
                 if error_val < 0:
-                    # 严重偏右，向右原地旋转
+                    # far off towards left, rotate towards left
                     direction_text = "spin_right"
                     status_text = "spin_right"
                     left_speed = spin_speed
                     right_speed = -spin_speed
                 else:
-                    # 严重偏左，向左原地旋转
+                    # far off towards right, rotate towards left
                     direction_text = "spin_left"
                     status_text = "spin_left"
                     left_speed = -spin_speed
                     right_speed = spin_speed
-
-            # 执行电机控制
+                    
             set_motors(left_speed, right_speed)
 
         else:
-            # 黑线丢失
+            # line lost from frame, enable line recovery
             if line_lost_recovery_enabled:
                 is_recovering, direction, should_continue = get_recovery_state()
                 
                 if not is_recovering:
-                    # 第一次检测到丢线，启动恢复
                     start_line_recovery()
                     is_recovering, direction, should_continue = get_recovery_state()
                 
                 if should_continue and direction:
-                    # 继续恢复
+                    # proceed to search for line
                     recovery_status = f"recovery_{direction}"
                     recovery_reason = f"pixel_dist_{direction}"
                     left_speed, right_speed = perform_recovery_rotation(direction)
@@ -433,20 +429,19 @@ def processing_loop():
                     direction_text = f"recovery_{direction}"
                     set_motors(left_speed, right_speed)
                 else:
-                    # 恢复失败或超时，停止
+                 # timeout, stop motors
                     stop_line_recovery()
                     stop_motors()
                     recovery_status = "inactive"
                     recovery_reason = "recovery_failed"
             else:
-                # 恢复机制禁用，立即停止
                 stop_motors()
                 recovery_status = "inactive"
             
             center_x = -1
             center_y = -1
 
-        # 计算帧率
+        # calculate fps
         frame_count += 1
         time_now = time.time()
         if time_now - time_start >= 1:
@@ -454,7 +449,7 @@ def processing_loop():
             frame_count = 0
             time_start = time_now
 
-        # 更新状态字典
+        # update status dictionary
         with state_lock:
             robot_state.update({
                 "status": status_text,
@@ -468,7 +463,9 @@ def processing_loop():
                 "recovery_reason": recovery_reason
             })
 
-        # 图像绘制与推流准备
+        # copy captured frame, draw line and circle for debugging
+        # line represent center of frame
+        # circle represent center of mass of black line in frame
         raw_display = frame.copy()
         cv2.line(raw_display, (width // 2, 0), (width // 2, height - 1), (255, 0, 0), 1)
 
@@ -484,14 +481,12 @@ def processing_loop():
             latest_binary_frame = bin_display
 
 
-# ═══════════════════════════════════════════════════════════════
-# Flask Web 端推流
-# ═══════════════════════════════════════════════════════════════
-
+# setup flask server and web interface
+# web interface will display raw footage from picamera, and same footage converted into binary, along with circle and line drawn for center of mass and center of frame
 app = Flask(__name__)
 
 def encode_frame(frame_data):
-    """将图像编码为JPEG格式"""
+    """frame presented in jpeg"""
     success, buffer = cv2.imencode(
         '.jpg',
         frame_data,
@@ -501,7 +496,7 @@ def encode_frame(frame_data):
 
 
 def stream_generator(source_function):
-    """生成视频流的生成器"""
+    """generating web live streaming"""
     while True:
         with frame_lock:
             current_frame = source_function()
@@ -550,25 +545,22 @@ def api_state():
         return jsonify(dict(robot_state))
 
 
-# ═══════════════════════════════════════════════════════════════
-# 程序启动入口
-# ═══════════════════════════════════════════════════════════════
 
+# final startup, print current status, web interface address
 if __name__ == '__main__':
-    # 启动视觉与控制后台线程
     threading.Thread(
         target=processing_loop,
         daemon=True
     ).start()
 
-    print("处理线程已启动")
+    print("line following activate")
     print(f"丢线恢复机制: {'启用 (基于像素分布)' if line_lost_recovery_enabled else '禁用'}")
     print(f"历史缓存时长: {recovery_history_duration}秒")
     print(f"像素比例阈值: {pixel_ratio_threshold}")
 
     try:
-        print("Dashboard运行在: http://0.0.0.0:5000")
-        # 启动Flask服务器
+        print("Dashboard: http://0.0.0.0:5000")
+        # activate flask sever
         app.run(
             host='0.0.0.0',
             port=5000,
@@ -578,8 +570,8 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         print("\n收到退出信号，关闭中...")
     finally:
-        # 安全清理资源
+        # safely shut down system
         stop_motors()
         picam2.stop()
         GPIO.cleanup()
-        print("已安全关闭硬件资源")
+        print("all hardware successfully shut down")
