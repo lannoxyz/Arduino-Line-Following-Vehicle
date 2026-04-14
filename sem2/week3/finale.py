@@ -1,17 +1,17 @@
 """
-robot.py — 巡线 + 色块跟随 + 符号检测 + 反应系统
+finale.py
 Electrical Engineering Project
 
-巡线优先级:
-  ① 高饱和度色块跟随 (S > 220, area > 100px) — 最高优先级
-  ② 黑线跟随 (标准模式)
-  ③ 丢线恢复 (历史帧方向旋转)
+Action priority levels
+1. Line following of colour blobs/coloured lines
+2. Line following of black lines
+3. Line recovery
 
-线程分配 (RPi4 四核):
-  Core 0 — Flask Web 服务
-  Core 1 — 巡线视觉处理 + 电机控制 (processing_loop)
-  Core 2 — 相机采集 (capture_loop)
-  Core 3 — ONNX 推理 + 反应触发 (inference_loop)
+task assign (RPi4 four cores):
+  Core 0 — Flask Web 
+  Core 1 — processing_loop for motor control, line following
+  Core 2 — capture_loop from picamera
+  Core 3 — inference_loop, ONNX model output obtain for symbol detection
 """
 
 import time, sys, threading, os
