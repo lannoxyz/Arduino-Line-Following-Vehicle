@@ -467,7 +467,7 @@ def processing_loop():
                 stat = "blob_straight"; drct = "straight"
                 l_spd = r_spd = BASE_SPEED
               
-            # 5% ~ 40% of error：increased speed on one side of motor, the other motor speed remain constant
+            # 5% ~ 20% of error：increased speed on one side of motor, the other motor speed remain constant
             elif abs_err <= SPIN_ZONE_PCT:
                 k = (abs_err - DEAD_ZONE_PCT) / (SPIN_ZONE_PCT - DEAD_ZONE_PCT)
                 outer = BASE_SPEED + k * (MAX_SPEED - BASE_SPEED)
@@ -477,7 +477,7 @@ def processing_loop():
                 else: # slight off towards right, increase speed on left motor
                     drct = "left";  stat = "blob_adjust_left"
                     l_spd = BASE_SPEED; r_spd = outer
-            else:# 40% ~ 100%：spin zone, clockwise/anti clockwise rotation 
+            else:# 20% ~ 100%：spin zone, clockwise/anti clockwise rotation 
                 if err > 0:
                     drct = stat = "blob_spin_right"
                     l_spd =  SPIN_SPEED; r_spd = -SPIN_SPEED
