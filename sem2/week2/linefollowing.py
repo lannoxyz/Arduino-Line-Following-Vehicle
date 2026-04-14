@@ -36,7 +36,7 @@ binary_threshold = 150
 
 # size of zones for line following
 dead_zone_pct = 0.03  # within 3% of error, travel straight
-spin_zone_pct = 0.18  # 82%
+spin_zone_pct = 0.18  # 18~100%
 
 # define gpio pins
 pin_in1, pin_in2 = 27, 17
@@ -182,8 +182,6 @@ def analyze_pixel_distribution():
     with history_lock:
         if not frame_history:
             return None, 0.0
-        
-        # 合并最近历史帧
         height, width = None, None
         left_pixels = 0
         right_pixels = 0
@@ -213,7 +211,7 @@ def analyze_pixel_distribution():
         if right_ratio > pixel_ratio_threshold:
             # rotate right if more pixels on right side
             direction = "right"
-            confidence = right_ratio - 0.5  # 越接近 1.0，置信度越高
+            confidence = right_ratio - 0.5 
         elif right_ratio < (1.0 - pixel_ratio_threshold):
             # rotate left otherwise
             direction = "left"
@@ -374,7 +372,7 @@ def processing_loop():
                 left_speed = base_speed
                 right_speed = base_speed
 
-            # 3% ~ 40% of error：increased speed on one side of motor, the other motor speed remain constant
+            # 3% ~ 18% of error：increased speed on one side of motor, the other motor speed remain constant
             elif abs_error <= spin_zone_pct:
                   # linear increase from base speed-max speed depending on how far off is error
                 k_ratio = (abs_error - dead_zone_pct) / (spin_zone_pct - dead_zone_pct)
@@ -394,7 +392,7 @@ def processing_loop():
                     left_speed = inner_speed
                     right_speed = outer_speed
 
-            # 3. 40% ~ 100%：spin zone, clockwise/anti clockwise rotation 
+            # 18% ~ 100% of error：spin zone, clockwise/anti clockwise rotation 
             else:
                 if error_val < 0:
                     # far off towards left, rotate towards left
