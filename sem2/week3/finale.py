@@ -39,7 +39,7 @@ except ImportError:
 #  Configurations
 # ═══════════════════════════════════════════════════════════════
 
-CAMERA_RESOLUTION = (640, 480)
+CAMERA_RESOLUTION = (640, 480) # highest at 30 fps
 JPEG_QUALITY      = 60
 FLIP_MODE         = -1
 
@@ -62,21 +62,21 @@ HISTORY_DURATION      = 1.0
 PIXEL_RATIO_THRESHOLD = 0.5
 
 # Color Blob Following
-COLOR_BLOB_SAT_THRESHOLD = 220   # HSV 饱和度阈值，超过才算色块
-COLOR_BLOB_MIN_AREA      = 100   # 色块最小面积 (px²)，低于此值忽略
-COLOR_BLOB_VAL_MIN       = 30    # HSV 亮度下限，排除极暗噪点
+COLOR_BLOB_SAT_THRESHOLD = 220   # HSV saturation threshold
+COLOR_BLOB_MIN_AREA      = 100   # ignore all blob smaller than threshold
+COLOR_BLOB_VAL_MIN       = 30    # HSV minimum brightness threshold
 
-# GPIO 引脚 (L298N / TB6612)
+# GPIO pins define
 PIN_IN1, PIN_IN2 = 27, 17
 PIN_IN3, PIN_IN4 = 6, 5
 PIN_ENA, PIN_ENB = 12, 13
 
-# AI 模型参数
+# AI model parameters
 ONNX_MODEL_PATH    = "model.onnx"
 TFLITE_LABELS_PATH = "labels.txt"
 ONNX_INPUT_SIZE    = 224
 
-# 每个符号独立置信度阈值 (Per-symbol Confidence Thresholds)
+# Per-symbol Confidence Thresholds, how high to consider it detected
 CONF_THRESHOLDS = {
     "arrowleft":   60.0,
     "arrowright":  60.0,
@@ -94,19 +94,21 @@ ACTION_COOLDOWN_SEC = 7.0
 PORT = 5000
 
 # ═══════════════════════════════════════════════════════════════
-#  底层控制 (Low-level Control)
+#  Low-level Control
 # ═══════════════════════════════════════════════════════════════
 
+# gpio setup output
 GPIO.setmode(GPIO.BCM)
 GPIO.setwarnings(False)
 for pin in [PIN_IN1, PIN_IN2, PIN_IN3, PIN_IN4, PIN_ENA, PIN_ENB]:
     GPIO.setup(pin, GPIO.OUT)
 
+# 500Hz pwm frequency
 pwm_a = GPIO.PWM(PIN_ENA, 500); pwm_a.start(0)
 pwm_b = GPIO.PWM(PIN_ENB, 500); pwm_b.start(0)
 
 def set_motors(left, right):
-    """设置电机转速及方向 (-100 to 100)"""
+    """setup rotating speed of vehicle in left and right (-100 to 100)"""
     left  = max(-100.0, min(100.0, left))
     right = max(-100.0, min(100.0, right))
     GPIO.output(PIN_IN1, GPIO.HIGH if left  > 0 else GPIO.LOW)
@@ -120,19 +122,20 @@ def stop_motors():
     set_motors(0, 0)
 
 # ═══════════════════════════════════════════════════════════════
-#  视觉与推理 (Vision & Inference)
+#  Vision & Inference
 # ═══════════════════════════════════════════════════════════════
 
 print("Initializing Camera...")
 picam2 = Picamera2()
 picam2.configure(picam2.create_video_configuration(
-    main={"size": CAMERA_RESOLUTION, "format": "BGR888"},
-    controls={"FrameDurationLimits": (16666, 16666)}))
+    main={"size": CAMERA_RESOLUTION, "format": "BGR888"}, # BGR format captured
+  controls={"FrameDurationLimits": (33333, 33333)})) # 30 fps
 picam2.start(); time.sleep(1)
 
 _session = _input_name = None
 _labels  = []
 
+# load ONNX model
 def _load_onnx():
     global _session, _labels, _input_name
     if not os.path.exists(TFLITE_LABELS_PATH): return False
@@ -146,6 +149,8 @@ def _load_onnx():
     except Exception as e:
         print(f"Model Load Failed: {e}"); return False
 
+# image processing for ONNX model
+# BGR > resize > grayscale > RGB 3 channels > float > NHCW
 def _onnx_classify(frame_bgr):
     resized = cv2.resize(frame_bgr, (ONNX_INPUT_SIZE, ONNX_INPUT_SIZE))
     gray    = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
@@ -153,107 +158,122 @@ def _onnx_classify(frame_bgr):
     img_f   = (rgb.astype(np.float32) / 255.0 - 0.449) / 0.226
     blob    = np.transpose(img_f, (2, 0, 1))[np.newaxis, ...]
     try:
-        scores = _session.run(None, {_input_name: blob})[0][0].astype(np.float32)
-        e_ = np.exp(scores - scores.max())
+        scores = _session.run(None, {_input_name: blob})[0][0].astype(np.float32) # run ONNX model
+        e_ = np.exp(scores - scores.max()) # convert scores into %
         probs = e_ / e_.sum()
-        idx = int(np.argmax(probs))
+        idx = int(np.argmax(probs)) # obtain class with highest confidence
         return _labels[idx], float(probs[idx] * 100)
     except:
         return "error", 0.0
 
 # ═══════════════════════════════════════════════════════════════
-#  共享状态与同步 (Shared State)
+#  Shared State, thread handling
 # ═══════════════════════════════════════════════════════════════
 
-frame_lock = threading.Lock()
-latest_raw_frame = None  # 带叠加显示的帧
-latest_cam_frame = None  # 原始采集帧
+frame_lock = threading.Lock() # locks thread, ensure only one thread can modify data
+latest_raw_frame = None  # original frame 
+latest_cam_frame = None  # processed frame
 
 state_lock  = threading.Lock()
-robot_state = {
+robot_state = { # core status of vehicle
     "status": "init", "direction": "straight", "error_pct": 0.0,
     "left_speed": 0.0, "right_speed": 0.0, "fps": 0.0, "black_ratio": 0.0,
     "line_lost_recovery": "inactive", "recovery_reason": "",
-    "blob_mode": False  # 是否处于色块跟随模式
+    "blob_mode": False  # whether blob tracking is used
 }
 
 symbol_lock = threading.Lock()
-symbol_state = {"shape": "—", "confidence": 0.0, "action": "none", "flash": False}
+symbol_state = {"shape": "—", "confidence": 0.0, "action": "none", "flash": False} # core status for symbol detection
 
 action_lock  = threading.Lock()
-action_state = {"running": False, "permanent_stop": False}
+action_state = {"running": False, "permanent_stop": False} # whether if vehicle is moving or stopped
 
 _action_cooldown = {}
-frame_history = deque()
+frame_history = deque() # stores frame in deque
+
+# line recovery when line is lost
 history_lock  = threading.Lock()
 recovery_lock = threading.Lock()
 line_lost_state = {"is_recovering": False, "line_lost_time": None, "recovery_direction": None}
 
 # ═══════════════════════════════════════════════════════════════
-#  色块检测 (Color Blob Detection)
+#  Color Blob Detection
 # ═══════════════════════════════════════════════════════════════
 
 def _detect_color_blob(frame_bgr):
     """
-    检测帧中高饱和度色块，返回质心坐标与掩膜。
+    Detect high-saturation color blobs in a frame and return the centroid and mask.
 
-    原理：
-      - 转换到 HSV 空间，利用饱和度通道 S 独立于亮度的特性
-      - S > COLOR_BLOB_SAT_THRESHOLD 可靠过滤白/灰/黑等低饱和色
-      - 形态学开运算去除噪点，闭运算填补空洞
-      - 用矩计算色块质心
+    Principle：
+      - Convert into HSV space，so saturation is independant of lighting
+      - S > COLOR_BLOB_SAT_THRESHOLD to filter dull colours like white/gray/black
+      - Morphological cleanup
+      - Use moments to calculate center of mass
 
-    返回:
-      (cx, cy, sat_mask) — 找到色块时 cx/cy 为质心坐标
-      (None, None, sat_mask) — 未找到足够大色块
+    Returns:
+      (cx, cy, sat_mask) — location of center in cx/cy, binary image showing detected areas in sat_mask
+      (None, None, sat_mask) — no valid blob
     """
     hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
 
-    # 提取高饱和度掩膜 (排除极暗区域避免噪点)
+    # filter and keep strong colours like red and yellow, will be masked in white
     sat_mask = cv2.inRange(
         hsv,
-        (0,   COLOR_BLOB_SAT_THRESHOLD, COLOR_BLOB_VAL_MIN),
-        (180, 255,                      255)
+        (0,   COLOR_BLOB_SAT_THRESHOLD, COLOR_BLOB_VAL_MIN), # lower bound for HSV
+        (180, 255,                      255) # upper bound
     )
 
-    # 形态学处理：先开运算去噪，再闭运算填补色块内部空洞
+    # morphological cleanup
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     sat_mask = cv2.morphologyEx(sat_mask, cv2.MORPH_OPEN,  kernel)
     sat_mask = cv2.morphologyEx(sat_mask, cv2.MORPH_CLOSE, kernel)
 
-    moments = cv2.moments(sat_mask)
+    # compute center of mass of blob
+    moments = cv2.moments(sat_mask) 
     if moments["m00"] > COLOR_BLOB_MIN_AREA:
         cx = int(moments["m10"] / moments["m00"])
         cy = int(moments["m01"] / moments["m00"])
+        # m00 = total white pixels/colour blob kept
+        # m10 = total pixel value in x axis
+        # m01 = total pixel value in y axis
         return cx, cy, sat_mask
-
+  
     return None, None, sat_mask
 
 # ═══════════════════════════════════════════════════════════════
-#  丢线恢复逻辑 (Line Recovery)
+#  Line Recovery
+# pixel analysation when line is lost, guess on where line should be
+# binary image is flipped so the black line represented in white pixels
+# count number of white pixels in each left and right side and make comparison
 # ═══════════════════════════════════════════════════════════════
 
+# store captured frame in the latest second
 def add_frame_to_history(binary_image, timestamp):
     with history_lock:
         frame_history.append((timestamp, binary_image.copy()))
         cutoff = timestamp - HISTORY_DURATION
         while frame_history and frame_history[0][0] < cutoff: frame_history.popleft()
 
+# analyse frame stored
+# separate frame into left and right side from the middle
+# count and compare number of white pixels on each side ( binary image fed is inverted )
+# return left/right depending on whichever side has more white pixels
 def analyze_pixel_distribution():
     with history_lock:
         if not frame_history: return None, 0.0
         l_px = r_px = 0
         w = frame_history[0][1].shape[1]
         for _, b in frame_history:
-            l_px += cv2.countNonZero(b[:, :w//2])
-            r_px += cv2.countNonZero(b[:, w//2:])
-        total = l_px + r_px
+            l_px += cv2.countNonZero(b[:, :w//2]) # left side
+            r_px += cv2.countNonZero(b[:, w//2:]) # right side
+        total = l_px + r_px # total
         if total == 0: return None, 0.0
         r_ratio = r_px / total
         if r_ratio > PIXEL_RATIO_THRESHOLD: return "right", r_ratio - 0.5
         if r_ratio < (1.0 - PIXEL_RATIO_THRESHOLD): return "left", 0.5 - r_ratio
         return None, 0.0
 
+# trigger line recovery when line is lost
 def start_line_recovery():
     with recovery_lock:
         if not line_lost_state["is_recovering"]:
@@ -264,9 +284,11 @@ def start_line_recovery():
                 "recovery_direction": dir_rec
             })
 
+# stop line recovery when line is found
 def stop_line_recovery():
     with recovery_lock: line_lost_state["is_recovering"] = False
 
+# obtain current recovery status
 def get_recovery_state():
     with recovery_lock:
         if not line_lost_state["is_recovering"]: return False, None, False
@@ -277,23 +299,22 @@ def get_recovery_state():
         return True, line_lost_state["recovery_direction"], True
 
 # ═══════════════════════════════════════════════════════════════
-#  反应系统 (Reaction System)
+#  Reaction System, how should vehicle react to detected symbols
 # ═══════════════════════════════════════════════════════════════
 
 def _set_action(desc):
-    with symbol_lock: symbol_state["action"] = desc
+    with symbol_lock: symbol_state["action"] = desc # update status for debug
 
 def _is_in_cooldown(label):
-    return (time.time() - _action_cooldown.get(label.lower(), 0)) < ACTION_COOLDOWN_SEC
+    return (time.time() - _action_cooldown.get(label.lower(), 0)) < ACTION_COOLDOWN_SEC # cooldown 
 
 def _mark_cooldown(label):
     _action_cooldown[label.lower()] = time.time()
 
 def execute_action(label):
-    """在独立线程执行反应，确保 permanent_stop 优先被锁定"""
     key = label.lower()
 
-    # 1. 闪烁类 (Thumb/QR)
+    # 1. Thumb/QR, show 
     if key in ("thumb", "qrcode"):
         _set_action(f"flash_{key}")
         with symbol_lock: symbol_state["flash"] = True
@@ -303,7 +324,7 @@ def execute_action(label):
         _mark_cooldown(label)
         return
 
-    # 2. 永久停止类 (Button/Warning)
+    # 2. Button/Warning, stop
     if key in ("buttonsign", "warningsign"):
         with action_lock:
             action_state["permanent_stop"] = True
@@ -311,33 +332,33 @@ def execute_action(label):
         _set_action(f"{label} — STOPPED")
         stop_motors()
         print(f"[ACTION] Permanent stop triggered by {label}")
-        return  # 永久停止不进入 finally 恢复逻辑
+        return 
 
-    # 3. 动作类 (Arrow/Recycle)
+    # 3. Arrow/Recycle
     with action_lock:
         if not action_state["running"]:
             action_state["running"] = True
 
     try:
-        stop_motors()  # 确保巡线残留指令先被清除
+        stop_motors()  # reset from past reactions
         if key == "arrowup":
             _set_action("ArrowUp — Straight")
-            set_motors(BASE_SPEED, BASE_SPEED); time.sleep(1.2)
+            set_motors(BASE_SPEED, BASE_SPEED); time.sleep(1.2) # travel forward for 1.2s
 
         elif key in ("arrowleft", "arrowright"):
             direction = "left" if key == "arrowleft" else "right"
             _set_action(f"Arrow{direction.capitalize()} — Searching line...")
 
-            # 1. 直行一小段，驶过岔路口中心
+            # 1. forward for a small distance before rotating
             stop_motors()
             set_motors(BASE_SPEED, BASE_SPEED); time.sleep(0.8)
 
-            # 2. 盲转：甩掉原来的线，不检测
+            # 2. left/right rotation for 0.5s towards intended pathway
             spin_l = -SPIN_SPEED if direction == "left" else  SPIN_SPEED
             spin_r =  SPIN_SPEED if direction == "left" else -SPIN_SPEED
             set_motors(spin_l, spin_r); time.sleep(0.5)
 
-            # 3. 视觉闭环：转到找到新线为止
+            # 3. begin to search for line and continue line following
             LINE_CONFIRM_FRAMES = 3
             MAX_SEARCH_TIME     = 3.0
             found_count = 0
@@ -362,6 +383,7 @@ def execute_action(label):
             stop_motors()
             _set_action(f"Arrow{direction.capitalize()} — Done")
 
+      # recycle sign, rotate 360 degrees
         elif key == "recyclesign":
             _set_action("Recycle — Spin 360")
             time.sleep(0.1)
@@ -377,9 +399,10 @@ def execute_action(label):
         _mark_cooldown(label)
 
 # ═══════════════════════════════════════════════════════════════
-#  核心循环 (Thread Loops)
+#  Thread Loops
 # ═══════════════════════════════════════════════════════════════
 
+# continuous feed from picamera
 def capture_loop():
     global latest_cam_frame
     while True:
@@ -389,36 +412,35 @@ def capture_loop():
             with frame_lock: latest_cam_frame = frame
         except: time.sleep(0.01)
 
-
+# processing loop
 def processing_loop():
     global latest_raw_frame
     f_cnt, t_start, cur_fps = 0, time.time(), 0.0
 
     while True:
-        # 严密检查永久停止
+        # acquire action lock
         with action_lock:
             is_perm = action_state["permanent_stop"]
             is_run  = action_state["running"]
-
+          
+        # get latest feed from camera
         with frame_lock: frame = latest_cam_frame
-        if frame is None: time.sleep(0.01); continue
+        if frame is None: time.sleep(0.01); continue # pause for 10ms if no frame captured
 
         h, w = frame.shape[:2]
 
-        # 如果永久停止：强制刹车并仅推流
         if is_perm:
             stop_motors()
             with frame_lock: latest_raw_frame = frame.copy()
             time.sleep(0.1); continue
 
-        # 如果正在执行临时动作：挂起巡线控制，仅推流
         if is_run:
             disp = frame.copy()
             cv2.line(disp, (w//2, 0), (w//2, h-1), (255, 0, 0), 1)
             with frame_lock: latest_raw_frame = disp
             time.sleep(0.03); continue
 
-        # ── 初始化本帧状态变量 ──────────────────────────────────
+        # ── default configuration and status ──────────────────────────────────
         l_spd = r_spd = 0.0
         stat = drct = "no_line"
         err = 0.0
@@ -428,31 +450,34 @@ def processing_loop():
         blob_mode = False
 
         # ══════════════════════════════════════════════════════
-        #  优先级 ① — 高饱和度色块跟随
+        #  Colour blob detection and follow - first priority
         # ══════════════════════════════════════════════════════
         blob_cx, blob_cy, sat_mask = _detect_color_blob(frame)
 
         if blob_cx is not None:
             blob_mode = True
-            stop_line_recovery()  # 色块存在时重置丢线恢复计时
+            stop_line_recovery()  # stop line recovery when blob within vision
 
             cx, cy = blob_cx, blob_cy
-            err = (cx - w / 2) / (w / 2)
+            err = (cx - w / 2) / (w / 2) # calculate error from colour blob
             abs_err = abs(err)
 
+            # 0% ~ 5% of error：dead zone, proceed forward
             if abs_err <= DEAD_ZONE_PCT:
                 stat = "blob_straight"; drct = "straight"
                 l_spd = r_spd = BASE_SPEED
+              
+            # 5% ~ 40% of error：increased speed on one side of motor, the other motor speed remain constant
             elif abs_err <= SPIN_ZONE_PCT:
                 k = (abs_err - DEAD_ZONE_PCT) / (SPIN_ZONE_PCT - DEAD_ZONE_PCT)
                 outer = BASE_SPEED + k * (MAX_SPEED - BASE_SPEED)
-                if err > 0:
+                if err > 0: # slight off towards left, increase speed on right motor
                     drct = "right"; stat = "blob_adjust_right"
                     l_spd = outer;      r_spd = BASE_SPEED
-                else:
+                else: # slight off towards right, increase speed on left motor
                     drct = "left";  stat = "blob_adjust_left"
                     l_spd = BASE_SPEED; r_spd = outer
-            else:
+            else:# 40% ~ 100%：spin zone, clockwise/anti clockwise rotation 
                 if err > 0:
                     drct = stat = "blob_spin_right"
                     l_spd =  SPIN_SPEED; r_spd = -SPIN_SPEED
@@ -462,40 +487,32 @@ def processing_loop():
 
             set_motors(l_spd, r_spd)
 
-            # 叠加显示：青色轮廓 + 质心 + 标签
-            disp = frame.copy()
-            contours, _ = cv2.findContours(sat_mask, cv2.RETR_EXTERNAL,
-                                           cv2.CHAIN_APPROX_SIMPLE)
-            cv2.drawContours(disp, contours, -1, (0, 255, 255), 2)
-            cv2.circle(disp, (cx, cy), 10, (0, 255, 255), -1)
-            cv2.line(disp, (w // 2, cy), (cx, cy), (0, 200, 200), 2)
-            cv2.line(disp, (w // 2, 0), (w // 2, h - 1), (255, 0, 0), 1)
-            cv2.putText(disp, "BLOB MODE", (8, 24),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-
         else:
             # ══════════════════════════════════════════════════
-            #  优先级 ② — 黑线跟随 (标准巡线)
+            #  black line following - second priority
             # ══════════════════════════════════════════════════
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+          # image processing
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) # BGR > grayscale
             _, binary = cv2.threshold(gray, BINARY_THRESHOLD, 255,
-                                      cv2.THRESH_BINARY_INV)
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+                                      cv2.THRESH_BINARY_INV) # binary conversion + invert to use moments and compute center of mass
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)) # morphological cleanup
             binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN,  kernel)
             binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-
+  
             moments  = cv2.moments(binary)
             b_ratio  = cv2.countNonZero(binary) / (h * w)
-            has_line = moments["m00"] > LINE_LOST_THRESHOLD
+            has_line = moments["m00"] > LINE_LOST_THRESHOLD # number of white pixel is less than threshold -> line considered lost
             add_frame_to_history(binary, time.time())
 
             if has_line:
                 stop_line_recovery()
+              # calculate center of mass
                 cx = int(moments["m10"] / moments["m00"])
                 cy = int(moments["m01"] / moments["m00"])
                 err = (cx - w / 2) / (w / 2)
                 abs_err = abs(err)
-
+              
+                # same line following logic as colour blob for black lines
                 if abs_err <= DEAD_ZONE_PCT:
                     stat = drct = "straight"
                     l_spd = r_spd = BASE_SPEED
@@ -520,7 +537,7 @@ def processing_loop():
 
             else:
                 # ══════════════════════════════════════════════
-                #  优先级 ③ — 丢线恢复 (历史帧方向旋转)
+                #  line recovery - third priority
                 # ══════════════════════════════════════════════
                 if RECOVERY_ENABLED:
                     is_r, d, cont = get_recovery_state()
@@ -530,7 +547,7 @@ def processing_loop():
                     if cont and d:
                         rec_s = f"recovery_{d}"
                         l_spd, r_spd = (
-                            (RECOVERY_SPEED, -RECOVERY_SPEED) if d == "right"
+                            (RECOVERY_SPEED, -RECOVERY_SPEED) if d == "right" # rotate on the spot to search for line
                             else (-RECOVERY_SPEED, RECOVERY_SPEED)
                         )
                         set_motors(l_spd, r_spd)
@@ -540,14 +557,14 @@ def processing_loop():
                 else:
                     stop_motors()
 
-            # 叠加显示（黑线模式）
+            # draw and display middle vertical line, circle for center of mass, another horizontal line between circle and vertical line
             disp = frame.copy()
             cv2.line(disp, (w // 2, 0), (w // 2, h - 1), (255, 0, 0), 1)
             if has_line and cx != -1:
                 cv2.circle(disp, (cx, cy), 10, (0, 0, 255), -1)
                 cv2.line(disp, (w // 2, cy), (cx, cy), (0, 255, 0), 2)
 
-        # ── FPS 计算 ────────────────────────────────────────────
+        # ── FPS calculation ────────────────────────────────────────────
         f_cnt += 1
         if time.time() - t_start >= 1.0:
             cur_fps = f_cnt / (time.time() - t_start)
@@ -569,7 +586,6 @@ def processing_loop():
 
         with frame_lock:
             latest_raw_frame = disp
-
 
 def inference_loop():
     while True:
@@ -666,7 +682,7 @@ def api_state():
     with state_lock: return jsonify(dict(robot_state))
 
 # ═══════════════════════════════════════════════════════════════
-#  启动入口 (Entry Point)
+#  Entry Point
 # ═══════════════════════════════════════════════════════════════
 
 if __name__ == '__main__':
@@ -686,6 +702,7 @@ if __name__ == '__main__':
         def wrap(): _set_affinity(mask); target()
         threading.Thread(target=wrap, name=name, daemon=True).start()
 
+  # assign different task to each core in raspberry pi
     _spawn(capture_loop,    0b0100, "cap")   # Core 2
     _spawn(processing_loop, 0b0010, "line")  # Core 1
     _spawn(inference_loop,  0b1000, "inf")   # Core 3
