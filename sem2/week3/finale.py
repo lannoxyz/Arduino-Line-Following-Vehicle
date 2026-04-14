@@ -19,41 +19,41 @@ from collections import deque
 from flask import Flask, Response, jsonify
 import cv2, numpy as np
 
-# 基础库检查
+# library import check
 try:
     from picamera2 import Picamera2
 except ImportError:
-    print("错误: sudo apt install python3-picamera2"); sys.exit(1)
+    print("error: sudo apt install python3-picamera2"); sys.exit(1)
 
 try:
     import RPi.GPIO as GPIO
 except ImportError:
-    print("错误: sudo apt install python3-rpi.gpio"); sys.exit(1)
+    print("error: sudo apt install python3-rpi.gpio"); sys.exit(1)
 
 try:
     import onnxruntime as ort
 except ImportError:
-    print("错误: pip install onnxruntime --break-system-packages"); sys.exit(1)
+    print("error: pip install onnxruntime --break-system-packages"); sys.exit(1)
 
 # ═══════════════════════════════════════════════════════════════
-#  配置参数 (Configurations)
+#  Configurations
 # ═══════════════════════════════════════════════════════════════
 
 CAMERA_RESOLUTION = (640, 480)
 JPEG_QUALITY      = 60
 FLIP_MODE         = -1
 
-# 巡线算法参数 (Line Following)
+# Line Following
 BINARY_THRESHOLD      = 80
 DEAD_ZONE_PCT         = 0.05
 SPIN_ZONE_PCT         = 0.20
 
-# 速度配置 (Speed)
+# Speed
 BASE_SPEED            = 20
 MAX_SPEED             = 42
 SPIN_SPEED            = 42
 
-# 丢线恢复 (Recovery)
+# Line Recovery
 RECOVERY_ENABLED      = True
 RECOVERY_SPEED        = 42
 RECOVERY_TIMEOUT      = 3.0
@@ -61,7 +61,7 @@ LINE_LOST_THRESHOLD   = 100
 HISTORY_DURATION      = 1.0
 PIXEL_RATIO_THRESHOLD = 0.5
 
-# 色块巡线参数 (Color Blob Following)
+# Color Blob Following
 COLOR_BLOB_SAT_THRESHOLD = 220   # HSV 饱和度阈值，超过才算色块
 COLOR_BLOB_MIN_AREA      = 100   # 色块最小面积 (px²)，低于此值忽略
 COLOR_BLOB_VAL_MIN       = 30    # HSV 亮度下限，排除极暗噪点
