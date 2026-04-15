@@ -22,13 +22,13 @@ GPIO.setup(IN3, GPIO.OUT)
 GPIO.setup(IN4, GPIO.OUT)
 GPIO.setup(ENB, GPIO.OUT)
 
-# ====== PWM 设置 ======
-left_pwm = GPIO.PWM(ENA, 500)   # 100 Hz
+# ====== PWM setup ======
+left_pwm = GPIO.PWM(ENA, 500)   # 500 Hz
 right_pwm = GPIO.PWM(ENB, 500)
 left_pwm.start(50)
 right_pwm.start(50)
 
-# ====== 前进函数 ======
+# ====== forward ======
 def forward(duration=30, speed=100):
 
     GPIO.output(ENA, 255)
@@ -40,7 +40,7 @@ def forward(duration=30, speed=100):
     time.sleep(duration)
     print("Stopped")
 
-# ====== 主程序 ======
+# ====== call function ======
 try:
     forward()
 finally:
