@@ -6,6 +6,5 @@
 - Lanno
 - Oscar
 
-The project is started on 27th Oct 2025
-
-thanks for our contributions!
+The project is started on 27th Oct 2025, and end on 20th April 2026
+Thanks for the contributions!
