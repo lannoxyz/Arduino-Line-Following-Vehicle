@@ -1,4 +1,4 @@
-## Line-Following-Vehicle
+## Project-Line-Following-Vehicle
 *SEM1 - An Arduino UNO Rev 3 based smart car project with motor control, sensors, and simulation.</br>
 *SEM2 - An Raspberry Pi 4 based smart car project with camera visual detection machine learning, motor control and web interface.</br>
 
